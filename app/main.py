@@ -4,17 +4,46 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 
+import psycopg2
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 
 app = FastAPI(title="AI Chief Control Server")
 
-# --- TEMP policy state (we will store in Postgres next) ---
-KILLED_VERSIONS = set()          # e.g. {"2.0.17"}
-BETA_ENABLED = True              # admin can end beta
-LATEST_VERSION = os.getenv("LATEST_VERSION", "0.0.0")
-PATCH_URL = os.getenv("PATCH_URL", "")  # R2 URL later
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL not set")
+
+
+def db():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+
+def init_db():
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS installs (
+                install_id TEXT PRIMARY KEY,
+                version TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                first_seen TIMESTAMPTZ NOT NULL,
+                last_seen TIMESTAMPTZ NOT NULL,
+                uptime_s INTEGER
+            )
+            """)
+        conn.commit()
+
+
+@app.on_event("startup")
+def startup():
+    init_db()
+
+
+KILLED_VERSIONS = set()
+BETA_ENABLED = True
 
 
 @app.get("/")
@@ -22,26 +51,38 @@ def root():
     return {"status": "ok", "service": "ai-chief-control"}
 
 
-# ---------------------------
-# Client endpoints
-# ---------------------------
-
 class RegisterIn(BaseModel):
     install_id: str
     version: str
     platform: str = "windows"
-    channel: str = "beta"  # beta/prod
+    channel: str = "beta"
     machine_hash: Optional[str] = None
 
 
-class RegisterOut(BaseModel):
-    ok: bool
-    server_time: str
-
-
-@app.post("/install/register", response_model=RegisterOut)
+@app.post("/install/register")
 def register(body: RegisterIn):
-    return RegisterOut(ok=True, server_time=datetime.now(timezone.utc).isoformat())
+    now = datetime.now(timezone.utc)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO installs (install_id, version, channel, platform, first_seen, last_seen)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (install_id)
+            DO UPDATE SET
+                version = EXCLUDED.version,
+                channel = EXCLUDED.channel,
+                platform = EXCLUDED.platform,
+                last_seen = EXCLUDED.last_seen
+            """, (
+                body.install_id,
+                body.version,
+                body.channel,
+                body.platform,
+                now,
+                now,
+            ))
+        conn.commit()
+    return {"ok": True}
 
 
 class HeartbeatIn(BaseModel):
@@ -51,33 +92,27 @@ class HeartbeatIn(BaseModel):
     app_uptime_s: Optional[int] = None
 
 
-class HeartbeatOut(BaseModel):
-    ok: bool
-    server_time: str
-    beta_enabled: bool
-    kill_build: bool
-    kill_reason: Optional[str] = None
-    update_available: bool
-    latest_version: str
-    patch_url: Optional[str] = None
-    force_update: bool = False
+@app.post("/install/heartbeat")
+def heartbeat(body: HeartbeatIn):
+    now = datetime.now(timezone.utc)
 
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            UPDATE installs
+            SET version=%s, channel=%s, last_seen=%s, uptime_s=%s
+            WHERE install_id=%s
+            """, (
+                body.version,
+                body.channel,
+                now,
+                body.app_uptime_s,
+                body.install_id
+            ))
+        conn.commit()
 
-def _ver_tuple(v: str):
-    try:
-        return tuple(int(x) for x in v.split("."))
-    except Exception:
-        return (0, 0, 0)
-
-
-@app.post("/install/heartbeat", response_model=HeartbeatOut)
-def heartbeat(body: HeartbeatIn, x_aichief_key: Optional[str] = Header(default=None)):
-    # Optional: client shared key later
-    # if os.getenv("CLIENT_SHARED_KEY") and x_aichief_key != os.getenv("CLIENT_SHARED_KEY"):
-    #     raise HTTPException(status_code=401, detail="bad client key")
-
-    kill_reason = None
     kill_build = False
+    kill_reason = None
 
     if not BETA_ENABLED and body.channel == "beta":
         kill_build = True
@@ -87,30 +122,16 @@ def heartbeat(body: HeartbeatIn, x_aichief_key: Optional[str] = Header(default=N
         kill_build = True
         kill_reason = "version_disabled"
 
-    latest = os.getenv("LATEST_VERSION", LATEST_VERSION)
-    patch = os.getenv("PATCH_URL", PATCH_URL) or None
+    latest = os.getenv("LATEST_VERSION", "0.0.0")
 
-    update_available = _ver_tuple(latest) > _ver_tuple(body.version)
-
-    return HeartbeatOut(
-        ok=True,
-        server_time=datetime.now(timezone.utc).isoformat(),
-        beta_enabled=BETA_ENABLED,
-        kill_build=kill_build,
-        kill_reason=kill_reason,
-        update_available=update_available,
-        latest_version=latest,
-        patch_url=patch,
-        force_update=False,
-    )
-
-
-# ---------------------------
-# Admin endpoints
-# ---------------------------
-
-def _require_admin(x_admin: Optional[str]):
-    pw = os.getenv("ADMIN_PASSWORD")
-    if not pw:
-        raise H
-
+    return {
+        "ok": True,
+        "server_time": now.isoformat(),
+        "beta_enabled": BETA_ENABLED,
+        "kill_build": kill_build,
+        "kill_reason": kill_reason,
+        "update_available": latest > body.version,
+        "latest_version": latest,
+        "patch_url": os.getenv("PATCH_URL"),
+        "force_update": False,
+    }
