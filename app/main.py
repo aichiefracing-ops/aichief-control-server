@@ -23,30 +23,32 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set")
 
-def db():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+_db_initialized = False
 
 def init_db():
+    global _db_initialized
+    if _db_initialized:
+        return
+
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS installs (
-                    install_id TEXT PRIMARY KEY,
-                    version TEXT NOT NULL,
-                    channel TEXT NOT NULL,
-                    platform TEXT NOT NULL,
-                    first_seen TIMESTAMPTZ NOT NULL,
-                    last_seen TIMESTAMPTZ NOT NULL,
-                    uptime_s INTEGER
-                )
-                """
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS installs (
+                install_id TEXT PRIMARY KEY,
+                version TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                first_seen TIMESTAMPTZ NOT NULL,
+                last_seen TIMESTAMPTZ NOT NULL,
+                uptime_s INTEGER
             )
+            """)
         conn.commit()
 
-@app.on_event("startup")
-def startup():
-    init_db()
+    _db_initialized = True
+
+
+
 
 # ------------------------------------------------------------
 # Root
