@@ -1,1 +1,76 @@
 
+# routes_tts.py (or inside your main FastAPI file)
+
+import os
+import requests
+from fastapi import APIRouter, Header, HTTPException
+from fastapi.responses import StreamingResponse
+
+router = APIRouter()
+
+def _require_control_key(x_aichief_key: str | None):
+    expected = os.getenv("CONTROL_API_KEY")
+    if not expected:
+        raise HTTPException(500, "CONTROL_API_KEY not set")
+    if not x_aichief_key or x_aichief_key != expected:
+        raise HTTPException(401, "invalid control key")
+
+@router.post("/tts/stream")
+def tts_stream(
+    body: dict,
+    x_aichief_key: str | None = Header(default=None),
+):
+    _require_control_key(x_aichief_key)
+
+    api_key = os.getenv("ELEVENLABS_API_KEY")
+    voice_id = os.getenv("ELEVENLABS_VOICE_ID")
+    model_id = os.getenv("ELEVENLABS_MODEL_ID", "")
+
+    if not api_key or not voice_id:
+        raise HTTPException(500, "ElevenLabs env not configured")
+
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "text required")
+
+    max_chars = int(os.getenv("TTS_MAX_CHARS", "800"))
+    if len(text) > max_chars:
+        raise HTTPException(400, f"text too long (max {max_chars})")
+
+    # ElevenLabs TTS streaming endpoint
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
+
+    payload = {
+        "text": text,
+    }
+
+    # optional model + voice settings
+    if model_id:
+        payload["model_id"] = model_id
+
+    if "voice_settings" in body:
+        payload["voice_settings"] = body["voice_settings"]
+
+    headers = {
+        "xi-api-key": api_key,               # ElevenLabs auth header :contentReference[oaicite:4]{index=4}
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg",
+    }
+
+    r = requests.post(url, json=payload, headers=headers, stream=True, timeout=60)
+
+    if r.status_code != 200:
+        # surface enough info to debug quickly
+        try:
+            err = r.json()
+        except Exception:
+            err = {"text": r.text[:300]}
+        raise HTTPException(502, {"elevenlabs_status": r.status_code, "error": err})
+
+    return StreamingResponse(
+        r.iter_content(chunk_size=64 * 1024),
+        media_type="audio/mpeg",
+        headers={
+            "Cache-Control": "no-store",
+        },
+    )
