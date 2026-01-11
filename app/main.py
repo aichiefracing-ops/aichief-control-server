@@ -7,6 +7,50 @@ from typing import Optional
 import psycopg2
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
+import os, json, requests
+from fastapi import Header, HTTPException
+from fastapi.responses import Response
+
+@app.post("/tts/synthesize")
+def tts_synthesize(payload: dict, x_aichief_key: str | None = Header(default=None)):
+    expected = (os.getenv("AICHIEF_SERVER_KEY") or "").strip()
+    if expected and (x_aichief_key or "").strip() != expected:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    text = (payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="missing text")
+
+    api_key = (os.getenv("ELEVENLABS_API_KEY") or "").strip()
+    voice_id = (os.getenv("ELEVENLABS_VOICE_ID") or "").strip()
+    model_id = (os.getenv("ELEVENLABS_MODEL_ID") or "eleven_multilingual_v2").strip()
+
+    if not api_key or not voice_id:
+        raise HTTPException(status_code=500, detail="server missing ElevenLabs config")
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    body = {
+        "text": text,
+        "model_id": model_id,
+        "voice_settings": payload.get("voice_settings") or {},
+    }
+
+    accept = (payload.get("accept") or "audio/wav").strip()
+
+    headers = {
+        "xi-api-key": api_key,
+        "content-type": "application/json",
+        "accept": accept,
+    }
+
+    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=60)
+    if not r.ok:
+        raise HTTPException(status_code=502, detail=f"elevenlabs error {r.status_code}: {r.text[:200]}")
+
+    # pass through audio bytes
+    media_type = "audio/wav" if accept == "audio/wav" else "audio/mpeg"
+    return Response(content=r.content, media_type=media_type)
+
 
 
 app = FastAPI(title="AI Chief Control Server")
