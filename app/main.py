@@ -2,171 +2,264 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
-from typing import Optional, Any, Dict
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional
 
-import requests
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="AI Chief Control Server", version="0.2.0")
+APP_VERSION = "0.2.1"
+
+DATA_DIR = Path(os.getenv("DATA_DIR") or ".")
+SETTINGS_PATH = DATA_DIR / "settings.json"
+INSTALLS_PATH = DATA_DIR / "installs.json"
+
+CONTROL_API_KEY = (os.getenv("CONTROL_API_KEY") or "").strip()
+
+app = FastAPI(title="AI Chief Control Server", version=APP_VERSION)
 
 
-# ------------------------- helpers -------------------------
+# -------------------------
+# Persistence helpers
+# -------------------------
+def _load_json(path: Path, default: Any) -> Any:
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return default
 
-def _require_key(x_aichief_key: Optional[str]) -> None:
-    expected = (os.getenv("CONTROL_API_KEY") or "").strip()
-    if not expected:
-        raise HTTPException(status_code=500, detail="Server missing CONTROL_API_KEY")
-    if (x_aichief_key or "").strip() != expected:
+
+def _save_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _require_admin(x_key: Optional[str], auth: Optional[str]) -> None:
+    """
+    Accept either:
+      x-aichief-key: <key>
+    or:
+      Authorization: Bearer <key>
+    """
+    if not CONTROL_API_KEY:
+        raise HTTPException(status_code=500, detail="CONTROL_API_KEY not set on server")
+
+    token = ""
+    if x_key:
+        token = x_key.strip()
+    elif auth and auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+
+    if not token or token != CONTROL_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = (os.getenv(name) or "").strip().lower()
-    if v == "":
-        return default
-    return v in ("1", "true", "yes", "y", "on")
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def _kill_matches(kill_build: str, version: str, channel: str) -> bool:
-    kb = (kill_build or "").strip().lower()
-    ver = (version or "").strip().lower()
-    ch = (channel or "").strip().lower()
-
-    if kb in ("", "none", "off", "0"):
-        return False
-    if kb == "all":
-        return True
-    if kb == ch:  # e.g. "beta" kills beta channel
-        return True
-    return kb == ver
-
-
-# ------------------------- models -------------------------
-
+# -------------------------
+# Models
+# -------------------------
 class RegisterIn(BaseModel):
     install_id: str
-    version: str
-    platform: str = "windows"
-    channel: str = "beta"
-    machine_hash: Optional[str] = None
+    machine: Optional[str] = None
+    user: Optional[str] = None
+    version: Optional[str] = None
+    channel: Optional[str] = "beta"
+
 
 class HeartbeatIn(BaseModel):
     install_id: str
-    version: str
-    channel: str = "beta"
-    app_uptime_s: Optional[int] = None
+    version: Optional[str] = None
+    channel: Optional[str] = "beta"
+
 
 class ClientConfigIn(BaseModel):
-    install_id: Optional[str] = None
-    version: str = "0.0.0"
+    version: str
     channel: str = "beta"
 
 
-# ------------------------- routes -------------------------
+class AdminSettings(BaseModel):
+    beta_enabled: bool = True
+    latest_version: str = "0.0.0"
+    patch_url: Optional[str] = None
+    force_update: bool = False
+
+
+class KillIn(BaseModel):
+    version: str
+    reason: Optional[str] = "version_disabled"
+
+
+class UnkillIn(BaseModel):
+    version: str
+
+
+# -------------------------
+# Boot defaults
+# -------------------------
+DEFAULT_SETTINGS = {
+    "beta_enabled": True,
+    "latest_version": "0.0.0",
+    "patch_url": None,
+    "force_update": False,
+    "killed_versions": {},  # version -> reason
+}
+
+DEFAULT_INSTALLS = {}  # install_id -> {last_seen, version, channel, machine, user}
+
 
 @app.get("/")
 def root() -> Dict[str, Any]:
-    return {"ok": True, "name": "AI Chief Control Server", "server_time": _now()}
+    return {"ok": True, "service": "ai-chief-control", "version": APP_VERSION}
 
 
+# -------------------------
+# Install APIs (already listed in your Swagger)
+# -------------------------
 @app.post("/install/register")
-def register(body: RegisterIn, x_aichief_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
-    _require_key(x_aichief_key)
-
-    # Minimal: accept + ack. (We can store in Postgres later.)
-    return {"ok": True, "server_time": _now()}
+def install_register(body: RegisterIn) -> Dict[str, Any]:
+    installs = _load_json(INSTALLS_PATH, DEFAULT_INSTALLS)
+    installs[body.install_id] = {
+        "install_id": body.install_id,
+        "machine": body.machine,
+        "user": body.user,
+        "version": body.version,
+        "channel": body.channel or "beta",
+        "last_seen": _now(),
+    }
+    _save_json(INSTALLS_PATH, installs)
+    return {"ok": True}
 
 
 @app.post("/install/heartbeat")
-def heartbeat(body: HeartbeatIn, x_aichief_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
-    _require_key(x_aichief_key)
+def install_heartbeat(body: HeartbeatIn) -> Dict[str, Any]:
+    installs = _load_json(INSTALLS_PATH, DEFAULT_INSTALLS)
+    item = installs.get(body.install_id) or {"install_id": body.install_id}
+    item["version"] = body.version or item.get("version")
+    item["channel"] = body.channel or item.get("channel") or "beta"
+    item["last_seen"] = _now()
+    installs[body.install_id] = item
+    _save_json(INSTALLS_PATH, installs)
+    return {"ok": True}
 
-    # Minimal: accept + ack. (We can store in Postgres later.)
-    return {"ok": True, "server_time": _now()}
 
-
+# -------------------------
+# Client policy (UI calls this)
+# -------------------------
 @app.post("/client/config")
-def client_config(body: ClientConfigIn, x_aichief_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
-    """
-    This is what the UI will poll.
-    Toggle these in Railway Variables:
-      BETA_ENABLED=true/false
-      KILL_BUILD=all OR beta OR 0.2.1
-      KILL_REASON=...
-      LATEST_VERSION=0.2.5
-      PATCH_URL=https://.../patch.zip
-    """
-    _require_key(x_aichief_key)
+def client_config(body: ClientConfigIn) -> Dict[str, Any]:
+    settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
 
-    beta_enabled = _env_bool("BETA_ENABLED", default=True)
-    kill_build = (os.getenv("KILL_BUILD") or "").strip()
-    kill_reason = (os.getenv("KILL_REASON") or "Build disabled by server.").strip()
-    latest_version = (os.getenv("LATEST_VERSION") or "0.0.0").strip()
-    patch_url = (os.getenv("PATCH_URL") or "").strip()
+    beta_enabled = bool(settings.get("beta_enabled", True))
+    latest_version = str(settings.get("latest_version", "0.0.0"))
+    patch_url = settings.get("patch_url")
+    force_update = bool(settings.get("force_update", False))
 
-    should_kill = (not beta_enabled) or _kill_matches(kill_build, body.version, body.channel)
+    killed = settings.get("killed_versions", {}) or {}
+    kill_reason = killed.get(body.version)
+
+    # Decide lock behavior
+    should_lock = False
+    reason = None
+
+    if not beta_enabled:
+        should_lock = True
+        reason = "Beta is currently disabled."
+
+    if kill_reason:
+        should_lock = True
+        reason = f"This build is disabled: {kill_reason}"
+
+    if force_update and latest_version and body.version != latest_version:
+        should_lock = True
+        reason = f"Update required. Your version {body.version} is behind."
 
     return {
         "ok": True,
-        "server_time": _now(),
         "beta_enabled": beta_enabled,
-        "kill_build": kill_build,
-        "kill_reason": kill_reason,
-        "should_lock": bool(should_kill),
         "latest_version": latest_version,
         "patch_url": patch_url,
+        "force_update": force_update,
+        "should_lock": should_lock,
+        "reason": reason or "",
     }
 
 
-@app.post("/tts/synthesize")
-def tts_synthesize(payload: Dict[str, Any], x_aichief_key: Optional[str] = Header(default=None)):
-    """
-    Proxies ElevenLabs so users never have your ElevenLabs key.
-    Requires Railway Variables:
-      CONTROL_API_KEY=...
-      ELEVENLABS_API_KEY=...
-      ELEVENLABS_VOICE_ID=...
-    Client posts: { "text": "...", "accept": "audio/wav" or "audio/mpeg" }
-    """
-    _require_key(x_aichief_key)
-
-    api_key = (os.getenv("ELEVENLABS_API_KEY") or "").strip()
-    voice_id = (os.getenv("ELEVENLABS_VOICE_ID") or "").strip()
-    if not api_key or not voice_id:
-        raise HTTPException(status_code=500, detail="Server missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID")
-
-    text = (payload.get("text") or "").strip()
-    if not text:
-        raise HTTPException(status_code=422, detail="Missing 'text'")
-
-    accept = (payload.get("accept") or "audio/mpeg").strip().lower()
-    if accept not in ("audio/mpeg", "audio/wav"):
-        accept = "audio/mpeg"
-
-    # ElevenLabs endpoint
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    headers = {
-        "xi-api-key": api_key,
-        "accept": accept,
-        "Content-Type": "application/json",
+# -------------------------
+# Admin APIs (your Admin UI needs these)
+# -------------------------
+@app.get("/admin/settings")
+def admin_get_settings(
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization)
+    settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
+    # Only return the knobs the UI shows
+    return {
+        "beta_enabled": bool(settings.get("beta_enabled", True)),
+        "latest_version": str(settings.get("latest_version", "0.0.0")),
+        "patch_url": settings.get("patch_url"),
+        "force_update": bool(settings.get("force_update", False)),
+        "killed_versions": settings.get("killed_versions", {}) or {},
     }
 
-    # Keep it simple: model_id optional
-    body = {
-        "text": text,
-        "model_id": payload.get("model_id") or "eleven_monolingual_v1",
-    }
-    # voice_settings optional
-    if isinstance(payload.get("voice_settings"), dict):
-        body["voice_settings"] = payload["voice_settings"]
 
-    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=60)
-    if not r.ok:
-        raise HTTPException(status_code=502, detail=f"elevenlabs error {r.status_code}: {r.text[:300]}")
+@app.post("/admin/settings")
+def admin_set_settings(
+    body: AdminSettings,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization)
+    settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
+    settings.update(body.model_dump())
+    _save_json(SETTINGS_PATH, settings)
+    return {"ok": True}
 
-    media_type = "audio/wav" if accept == "audio/wav" else "audio/mpeg"
-    return Response(content=r.content, media_type=media_type)
+
+@app.get("/admin/installs")
+def admin_installs(
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization)
+    installs = _load_json(INSTALLS_PATH, DEFAULT_INSTALLS)
+    # return as list for UI convenience
+    items = sorted(installs.values(), key=lambda x: x.get("last_seen", 0), reverse=True)
+    return {"ok": True, "installs": items}
+
+
+@app.post("/admin/kill")
+def admin_kill(
+    body: KillIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization)
+    settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
+    killed = settings.get("killed_versions", {}) or {}
+    killed[str(body.version)] = body.reason or "version_disabled"
+    settings["killed_versions"] = killed
+    _save_json(SETTINGS_PATH, settings)
+    return {"ok": True}
+
+
+@app.post("/admin/unkill")
+def admin_unkill(
+    body: UnkillIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization)
+    settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
+    killed = settings.get("killed_versions", {}) or {}
+    killed.pop(str(body.version), None)
+    settings["killed_versions"] = killed
+    _save_json(SETTINGS_PATH, settings)
+    return {"ok": True}
