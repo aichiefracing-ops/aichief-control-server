@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 
 DATA_DIR = Path(os.getenv("DATA_DIR") or ".")
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -41,21 +41,36 @@ def _now() -> float:
     return time.time()
 
 
-def _require_admin(x_key: Optional[str], auth: Optional[str]) -> None:
+def _require_admin(
+    x_aichief_key: Optional[str],
+    authorization: Optional[str],
+    control_api_key_hdr: Optional[str],
+    x_api_key: Optional[str],
+    control_api_key: Optional[str],
+) -> None:
     """
-    Accept either:
-      x-aichief-key: <key>
-    or:
-      Authorization: Bearer <key>
+    Accept admin auth from any of these headers (so UI can be sloppy and we still work):
+      - x-aichief-key: <key>
+      - Authorization: Bearer <key>
+      - CONTROL_API_KEY: <key>
+      - x-api-key: <key>
+      - control-api-key: <key>
     """
     if not CONTROL_API_KEY:
         raise HTTPException(status_code=500, detail="CONTROL_API_KEY not set on server")
 
+    # Pick the first provided token
     token = ""
-    if x_key:
-        token = x_key.strip()
-    elif auth and auth.lower().startswith("bearer "):
-        token = auth.split(" ", 1)[1].strip()
+    if x_aichief_key:
+        token = x_aichief_key.strip()
+    elif control_api_key_hdr:
+        token = control_api_key_hdr.strip()
+    elif x_api_key:
+        token = x_api_key.strip()
+    elif control_api_key:
+        token = control_api_key.strip()
+    elif authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
 
     if not token or token != CONTROL_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -119,7 +134,7 @@ def root() -> Dict[str, Any]:
 
 
 # -------------------------
-# Install APIs (already listed in your Swagger)
+# Install APIs
 # -------------------------
 @app.post("/install/register")
 def install_register(body: RegisterIn) -> Dict[str, Any]:
@@ -163,7 +178,6 @@ def client_config(body: ClientConfigIn) -> Dict[str, Any]:
     killed = settings.get("killed_versions", {}) or {}
     kill_reason = killed.get(body.version)
 
-    # Decide lock behavior
     should_lock = False
     reason = None
 
@@ -191,16 +205,20 @@ def client_config(body: ClientConfigIn) -> Dict[str, Any]:
 
 
 # -------------------------
-# Admin APIs (your Admin UI needs these)
+# Admin APIs (Admin UI calls these)
 # -------------------------
 @app.get("/admin/settings")
 def admin_get_settings(
     x_aichief_key: Optional[str] = Header(default=None),
     authorization: Optional[str] = Header(default=None),
+
+    # accept common alternates without changing the UI
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
 ) -> Dict[str, Any]:
-    _require_admin(x_aichief_key, authorization)
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
     settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
-    # Only return the knobs the UI shows
     return {
         "beta_enabled": bool(settings.get("beta_enabled", True)),
         "latest_version": str(settings.get("latest_version", "0.0.0")),
@@ -215,8 +233,12 @@ def admin_set_settings(
     body: AdminSettings,
     x_aichief_key: Optional[str] = Header(default=None),
     authorization: Optional[str] = Header(default=None),
+
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
 ) -> Dict[str, Any]:
-    _require_admin(x_aichief_key, authorization)
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
     settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
     settings.update(body.model_dump())
     _save_json(SETTINGS_PATH, settings)
@@ -227,10 +249,13 @@ def admin_set_settings(
 def admin_installs(
     x_aichief_key: Optional[str] = Header(default=None),
     authorization: Optional[str] = Header(default=None),
+
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
 ) -> Dict[str, Any]:
-    _require_admin(x_aichief_key, authorization)
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
     installs = _load_json(INSTALLS_PATH, DEFAULT_INSTALLS)
-    # return as list for UI convenience
     items = sorted(installs.values(), key=lambda x: x.get("last_seen", 0), reverse=True)
     return {"ok": True, "installs": items}
 
@@ -240,8 +265,12 @@ def admin_kill(
     body: KillIn,
     x_aichief_key: Optional[str] = Header(default=None),
     authorization: Optional[str] = Header(default=None),
+
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
 ) -> Dict[str, Any]:
-    _require_admin(x_aichief_key, authorization)
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
     settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
     killed = settings.get("killed_versions", {}) or {}
     killed[str(body.version)] = body.reason or "version_disabled"
@@ -255,8 +284,12 @@ def admin_unkill(
     body: UnkillIn,
     x_aichief_key: Optional[str] = Header(default=None),
     authorization: Optional[str] = Header(default=None),
+
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
 ) -> Dict[str, Any]:
-    _require_admin(x_aichief_key, authorization)
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
     settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
     killed = settings.get("killed_versions", {}) or {}
     killed.pop(str(body.version), None)
