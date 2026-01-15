@@ -122,6 +122,12 @@ DEFAULT_SETTINGS = {
     "latest_version": "0.0.0",
     "patch_url": None,
     "force_update": False,
+
+    # --- Garage Info (client UI) ---
+    "garage_status": "",
+    "garage_note": "",
+    "garage_subnote": "",
+
     "killed_versions": {},  # version -> reason
 }
 
@@ -174,6 +180,9 @@ def client_config(body: ClientConfigIn) -> Dict[str, Any]:
     latest_version = str(settings.get("latest_version", "0.0.0"))
     patch_url = settings.get("patch_url")
     force_update = bool(settings.get("force_update", False))
+    garage_status = str(settings.get("garage_status", ""))
+    garage_note = str(settings.get("garage_note", ""))
+    garage_subnote = str(settings.get("garage_subnote", ""))
 
     killed = settings.get("killed_versions", {}) or {}
     kill_reason = killed.get(body.version)
@@ -192,6 +201,7 @@ def client_config(body: ClientConfigIn) -> Dict[str, Any]:
     if force_update and latest_version and body.version != latest_version:
         should_lock = True
         reason = f"Update required. Your version {body.version} is behind."
+    
 
     return {
         "ok": True,
@@ -201,6 +211,11 @@ def client_config(body: ClientConfigIn) -> Dict[str, Any]:
         "force_update": force_update,
         "should_lock": should_lock,
         "reason": reason or "",
+    
+        # --- Garage Info (sent to UI) ---
+        "garage_status": garage_status,
+        "garage_note": garage_note,
+        "garage_subnote": garage_subnote,
     }
 
 
