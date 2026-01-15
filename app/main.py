@@ -104,6 +104,12 @@ class AdminSettings(BaseModel):
     patch_url: Optional[str] = None
     force_update: bool = False
 
+    # --- Garage Info (client UI) ---
+    garage_status: str = ""
+    garage_note: str = ""
+    garage_subnote: str = ""
+
+
 
 class KillIn(BaseModel):
     version: str
@@ -240,6 +246,10 @@ def admin_get_settings(
         "patch_url": settings.get("patch_url"),
         "force_update": bool(settings.get("force_update", False)),
         "killed_versions": settings.get("killed_versions", {}) or {},
+            # --- Garage Info (client UI) ---
+        "garage_status": str(settings.get("garage_status", "") or ""),
+        "garage_note": str(settings.get("garage_note", "") or ""),
+        "garage_subnote": str(settings.get("garage_subnote", "") or ""),
     }
 
 
