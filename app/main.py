@@ -327,7 +327,8 @@ def admin_unkill(
     settings["killed_versions"] = killed
     _save_json(SETTINGS_PATH, settings)
     return {"ok": True}
-    @app.post("/tts/stream")
+    
+@app.post("/tts/stream")
 def tts_stream(
     body: TtsIn,
     x_aichief_key: Optional[str] = Header(default=None),
