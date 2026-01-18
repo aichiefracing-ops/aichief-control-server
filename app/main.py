@@ -8,6 +8,8 @@ from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
+from fastapi import Response
+import requests
 
 APP_VERSION = "0.2.2"
 
@@ -85,6 +87,10 @@ class RegisterIn(BaseModel):
     user: Optional[str] = None
     version: Optional[str] = None
     channel: Optional[str] = "beta"
+    
+class TtsIn(BaseModel):
+    text: str
+    accept: Optional[str] = "audio/wav"
 
 
 class HeartbeatIn(BaseModel):
@@ -321,3 +327,50 @@ def admin_unkill(
     settings["killed_versions"] = killed
     _save_json(SETTINGS_PATH, settings)
     return {"ok": True}
+    @app.post("/tts/stream")
+def tts_stream(
+    body: TtsIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+):
+    # protect your credits
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing text")
+
+    api_key = (os.getenv("ELEVENLABS_API_KEY") or "").strip()
+    voice_id = (os.getenv("ELEVENLABS_VOICE_ID") or "").strip()
+    model_id = (os.getenv("ELEVENLABS_MODEL_ID") or "eleven_multilingual_v2").strip()
+
+    if not api_key or not voice_id:
+        raise HTTPException(status_code=500, detail="Missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID")
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
+    headers = {
+        "xi-api-key": api_key,
+        "Accept": "audio/mpeg",  # ElevenLabs streams MP3
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "text": text,
+        "model_id": model_id,
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.75,
+            "style": 0.0,
+            "use_speaker_boost": True,
+        },
+    }
+
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    if not r.ok or not r.content:
+        raise HTTPException(status_code=502, detail=f"ElevenLabs failed status={r.status_code}")
+
+    # Return MP3 bytes; your warmer/client converts MP3->WAV and deletes MP3
+    return Response(content=r.content, media_type="audio/mpeg")
+
