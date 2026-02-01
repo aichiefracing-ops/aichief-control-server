@@ -238,26 +238,27 @@ def client_config(body: ClientConfigIn) -> Dict[str, Any]:
 def admin_get_settings(
     x_aichief_key: Optional[str] = Header(default=None),
     authorization: Optional[str] = Header(default=None),
-
-    # accept common alternates without changing the UI
     control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
     x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
     control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
 ) -> Dict[str, Any]:
     _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
-    settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
+    settings = _load_json(SETTINGS_PATH, {}) # Use empty dict as default to be safe
+    
     return {
         "beta_enabled": bool(settings.get("beta_enabled", True)),
         "latest_version": str(settings.get("latest_version", "0.0.0")),
         "patch_url": settings.get("patch_url"),
         "force_update": bool(settings.get("force_update", False)),
-        "killed_versions": settings.get("killed_versions", {}) or {},
-            # --- Garage Info (client UI) ---
+        
+        # --- CRITICAL FIX: Send 'kill_list' (Client expects this!) ---
+        "kill_list": settings.get("kill_list", []),
+        
+        # --- Garage Info ---
         "garage_status": str(settings.get("garage_status", "") or ""),
         "garage_note": str(settings.get("garage_note", "") or ""),
         "garage_subnote": str(settings.get("garage_subnote", "") or ""),
     }
-
 
 @app.post("/admin/settings")
 def admin_set_settings(
