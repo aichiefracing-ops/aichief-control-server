@@ -4,14 +4,14 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from fastapi import Response
 import requests
 
-APP_VERSION = "0.2.2"
+APP_VERSION = "0.2.3"
 
 DATA_DIR = Path(os.getenv("DATA_DIR") or ".")
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -51,17 +51,11 @@ def _require_admin(
     control_api_key: Optional[str],
 ) -> None:
     """
-    Accept admin auth from any of these headers (so UI can be sloppy and we still work):
-      - x-aichief-key: <key>
-      - Authorization: Bearer <key>
-      - CONTROL_API_KEY: <key>
-      - x-api-key: <key>
-      - control-api-key: <key>
+    Accept admin auth from any of these headers.
     """
     if not CONTROL_API_KEY:
         raise HTTPException(status_code=500, detail="CONTROL_API_KEY not set on server")
 
-    # Pick the first provided token
     token = ""
     if x_aichief_key:
         token = x_aichief_key.strip()
@@ -92,35 +86,31 @@ class TtsIn(BaseModel):
     text: str
     accept: Optional[str] = "audio/wav"
 
-
 class HeartbeatIn(BaseModel):
     install_id: str
     version: Optional[str] = None
     channel: Optional[str] = "beta"
 
-
 class ClientConfigIn(BaseModel):
     version: str
     channel: str = "beta"
-
 
 class AdminSettings(BaseModel):
     beta_enabled: bool = True
     latest_version: str = "0.0.0"
     patch_url: Optional[str] = None
     force_update: bool = False
+    
+    # New Kill List support
+    kill_list: List[str] = []
 
     # --- Garage Info (client UI) ---
     garage_status: str = ""
     garage_note: str = ""
     garage_subnote: str = ""
 
-
-
 class KillIn(BaseModel):
     version: str
-    reason: Optional[str] = "version_disabled"
-
 
 class UnkillIn(BaseModel):
     version: str
@@ -134,21 +124,71 @@ DEFAULT_SETTINGS = {
     "latest_version": "0.0.0",
     "patch_url": None,
     "force_update": False,
+    "kill_list": [],  # List of strings ["1.0.6", "1.0.5"]
 
     # --- Garage Info (client UI) ---
     "garage_status": "",
     "garage_note": "",
     "garage_subnote": "",
-
-    "killed_versions": {},  # version -> reason
 }
 
-DEFAULT_INSTALLS = {}  # install_id -> {last_seen, version, channel, machine, user}
+DEFAULT_INSTALLS = {}
 
 
 @app.get("/")
 def root() -> Dict[str, Any]:
     return {"ok": True, "service": "ai-chief-control", "version": APP_VERSION}
+
+
+# -------------------------
+# Public APIs (Client Calls)
+# -------------------------
+
+# --- THIS IS THE NEW ENDPOINT THE CLIENT NEEDS ---
+@app.get("/settings")
+def get_settings(x_aichief_key: Optional[str] = Header(None, alias="x-aichief-key")):
+    """
+    Public endpoint for clients to pull Latest Version, Garage Info, and Kill List.
+    No strict auth required (clients need to know if they are dead).
+    """
+    current = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
+    
+    # Safety: ensure list exists
+    if "kill_list" not in current:
+        current["kill_list"] = []
+        
+    # Filter out sensitive admin stuff if you add any later
+    # For now, sending the whole settings object is fine
+    return current
+
+
+# Legacy endpoint (Keep for older clients if needed, but 1.0.6+ uses GET /settings)
+@app.post("/client/config")
+def client_config(body: ClientConfigIn) -> Dict[str, Any]:
+    settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
+    
+    # Translate new list logic to old boolean logic for old clients
+    kill_list = settings.get("kill_list", [])
+    
+    should_lock = False
+    reason = None
+    
+    if str(body.version) in kill_list:
+        should_lock = True
+        reason = f"Version {body.version} disabled."
+
+    return {
+        "ok": True,
+        "beta_enabled": settings.get("beta_enabled", True),
+        "latest_version": settings.get("latest_version", "0.0.0"),
+        "patch_url": settings.get("patch_url"),
+        "force_update": settings.get("force_update", False),
+        "should_lock": should_lock,
+        "reason": reason or "",
+        "garage_status": settings.get("garage_status", ""),
+        "garage_note": settings.get("garage_note", ""),
+        "garage_subnote": settings.get("garage_subnote", ""),
+    }
 
 
 # -------------------------
@@ -182,57 +222,7 @@ def install_heartbeat(body: HeartbeatIn) -> Dict[str, Any]:
 
 
 # -------------------------
-# Client policy (UI calls this)
-# -------------------------
-@app.post("/client/config")
-def client_config(body: ClientConfigIn) -> Dict[str, Any]:
-    settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
-
-    beta_enabled = bool(settings.get("beta_enabled", True))
-    latest_version = str(settings.get("latest_version", "0.0.0"))
-    patch_url = settings.get("patch_url")
-    force_update = bool(settings.get("force_update", False))
-    garage_status = str(settings.get("garage_status", ""))
-    garage_note = str(settings.get("garage_note", ""))
-    garage_subnote = str(settings.get("garage_subnote", ""))
-
-    killed = settings.get("killed_versions", {}) or {}
-    kill_reason = killed.get(body.version)
-
-    should_lock = False
-    reason = None
-
-    if not beta_enabled:
-        should_lock = True
-        reason = "Beta is currently disabled."
-
-    if kill_reason:
-        should_lock = True
-        reason = f"This build is disabled: {kill_reason}"
-
-    if force_update and latest_version and body.version != latest_version:
-        should_lock = True
-        reason = f"Update required. Your version {body.version} is behind."
-    
-
-    return {
-        "ok": True,
-        "beta_enabled": beta_enabled,
-        "latest_version": latest_version,
-        "patch_url": patch_url,
-        "force_update": force_update,
-        "should_lock": should_lock,
-        "reason": reason or "",
-    
-        # --- Garage Info (sent to UI) ---
-        "garage_status": garage_status,
-        "garage_note": garage_note,
-        "garage_subnote": garage_subnote,
-    }
-
-
-# -------------------------
-# Admin APIs (Admin UI calls these)
+# Admin APIs (Admin Dashboard Calls)
 # -------------------------
 @app.get("/admin/settings")
 def admin_get_settings(
@@ -243,36 +233,30 @@ def admin_get_settings(
     control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
 ) -> Dict[str, Any]:
     _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
-    settings = _load_json(SETTINGS_PATH, {}) # Use empty dict as default to be safe
+    settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
     
-    return {
-        "beta_enabled": bool(settings.get("beta_enabled", True)),
-        "latest_version": str(settings.get("latest_version", "0.0.0")),
-        "patch_url": settings.get("patch_url"),
-        "force_update": bool(settings.get("force_update", False)),
+    # Ensure kill_list is present for the UI
+    if "kill_list" not in settings:
+        settings["kill_list"] = []
         
-        # --- CRITICAL FIX: Send 'kill_list' (Client expects this!) ---
-        "kill_list": settings.get("kill_list", []),
-        
-        # --- Garage Info ---
-        "garage_status": str(settings.get("garage_status", "") or ""),
-        "garage_note": str(settings.get("garage_note", "") or ""),
-        "garage_subnote": str(settings.get("garage_subnote", "") or ""),
-    }
+    return settings
 
 @app.post("/admin/settings")
 def admin_set_settings(
     body: AdminSettings,
     x_aichief_key: Optional[str] = Header(default=None),
     authorization: Optional[str] = Header(default=None),
-
     control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
     x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
     control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
 ) -> Dict[str, Any]:
     _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
     settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
-    settings.update(body.model_dump())
+    
+    # Clean update
+    update_data = body.model_dump()
+    settings.update(update_data)
+    
     _save_json(SETTINGS_PATH, settings)
     return {"ok": True}
 
@@ -281,7 +265,6 @@ def admin_set_settings(
 def admin_installs(
     x_aichief_key: Optional[str] = Header(default=None),
     authorization: Optional[str] = Header(default=None),
-
     control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
     x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
     control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
@@ -297,18 +280,22 @@ def admin_kill(
     body: KillIn,
     x_aichief_key: Optional[str] = Header(default=None),
     authorization: Optional[str] = Header(default=None),
-
     control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
     x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
     control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
 ) -> Dict[str, Any]:
     _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    
     settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
-    killed = settings.get("killed_versions", {}) or {}
-    killed[str(body.version)] = body.reason or "version_disabled"
-    settings["killed_versions"] = killed
-    _save_json(SETTINGS_PATH, settings)
-    return {"ok": True}
+    kill_list = settings.get("kill_list", [])
+    
+    ver = str(body.version).strip()
+    if ver and ver not in kill_list:
+        kill_list.append(ver)
+        settings["kill_list"] = kill_list
+        _save_json(SETTINGS_PATH, settings)
+        
+    return {"ok": True, "killed": ver, "current_list": kill_list}
 
 
 @app.post("/admin/unkill")
@@ -316,19 +303,24 @@ def admin_unkill(
     body: UnkillIn,
     x_aichief_key: Optional[str] = Header(default=None),
     authorization: Optional[str] = Header(default=None),
-
     control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
     x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
     control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
 ) -> Dict[str, Any]:
     _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
-    settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
-    killed = settings.get("killed_versions", {}) or {}
-    killed.pop(str(body.version), None)
-    settings["killed_versions"] = killed
-    _save_json(SETTINGS_PATH, settings)
-    return {"ok": True}
     
+    settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
+    kill_list = settings.get("kill_list", [])
+    
+    ver = str(body.version).strip()
+    if ver in kill_list:
+        kill_list.remove(ver)
+        settings["kill_list"] = kill_list
+        _save_json(SETTINGS_PATH, settings)
+        
+    return {"ok": True, "unkilled": ver, "current_list": kill_list}
+
+
 @app.post("/tts/stream")
 def tts_stream(
     body: TtsIn,
@@ -352,10 +344,13 @@ def tts_stream(
     if not api_key or not voice_id:
         raise HTTPException(status_code=500, detail="Missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID")
 
+    # -----------------------------------------------------------
+    # We ask 11Labs for MP3 (standard), but client converts to WAV
+    # -----------------------------------------------------------
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
     headers = {
         "xi-api-key": api_key,
-        "Accept": "audio/mpeg",  # ElevenLabs streams MP3
+        "Accept": "audio/mpeg", 
         "Content-Type": "application/json",
     }
     payload = {
@@ -373,6 +368,4 @@ def tts_stream(
     if not r.ok or not r.content:
         raise HTTPException(status_code=502, detail=f"ElevenLabs failed status={r.status_code}")
 
-    # Return MP3 bytes; your warmer/client converts MP3->WAV and deletes MP3
     return Response(content=r.content, media_type="audio/mpeg")
-
