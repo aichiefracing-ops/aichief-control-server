@@ -162,34 +162,62 @@ def get_settings(x_aichief_key: Optional[str] = Header(None, alias="x-aichief-ke
     return current
 
 
-# Legacy endpoint (Keep for older clients if needed, but 1.0.6+ uses GET /settings)
+# -------------------------
+# Client policy (Legacy Support for 1.0.6 and older)
+# -------------------------
 @app.post("/client/config")
 def client_config(body: ClientConfigIn) -> Dict[str, Any]:
     settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
+
+    beta_enabled = bool(settings.get("beta_enabled", True))
+    latest_version = str(settings.get("latest_version", "0.0.0"))
+    patch_url = settings.get("patch_url")
+    force_update = bool(settings.get("force_update", False))
     
-    # Translate new list logic to old boolean logic for old clients
+    # Garage info
+    garage_status = str(settings.get("garage_status", ""))
+    garage_note = str(settings.get("garage_note", ""))
+    garage_subnote = str(settings.get("garage_subnote", ""))
+
+    # --- CRITICAL FIX: Check the NEW Kill List ---
+    # Old clients don't know about "kill_list", so we must check it for them here
+    # and return the result as 'should_lock'.
     kill_list = settings.get("kill_list", [])
-    
+    safe_kill_list = [str(k).strip() for k in kill_list]
+
     should_lock = False
     reason = None
-    
-    if str(body.version) in kill_list:
+
+    # 1. Global Beta Lock
+    if not beta_enabled:
         should_lock = True
-        reason = f"Version {body.version} disabled."
+        reason = "Beta is currently disabled."
+
+    # 2. Version Kill Switch (The Fix)
+    if str(body.version) in safe_kill_list:
+        should_lock = True
+        reason = f"This build ({body.version}) has been disabled.\nPlease update."
+
+    # 3. Force Update
+    if force_update and latest_version and body.version != latest_version:
+        should_lock = True
+        reason = f"Update required. Your version {body.version} is behind."
+    
 
     return {
         "ok": True,
-        "beta_enabled": settings.get("beta_enabled", True),
-        "latest_version": settings.get("latest_version", "0.0.0"),
-        "patch_url": settings.get("patch_url"),
-        "force_update": settings.get("force_update", False),
-        "should_lock": should_lock,
-        "reason": reason or "",
-        "garage_status": settings.get("garage_status", ""),
-        "garage_note": settings.get("garage_note", ""),
-        "garage_subnote": settings.get("garage_subnote", ""),
+        "beta_enabled": beta_enabled,
+        "latest_version": latest_version,
+        "patch_url": patch_url,
+        "force_update": force_update,
+        "should_lock": should_lock,  # <--- Old client reads this
+        "reason": reason or "",      # <--- Old client reads this
+    
+        # --- Garage Info (sent to UI) ---
+        "garage_status": garage_status,
+        "garage_note": garage_note,
+        "garage_subnote": garage_subnote,
     }
-
 
 # -------------------------
 # Install APIs
