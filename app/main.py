@@ -527,10 +527,31 @@ def debug_stripe(
                             "product_id": item.get("price", {}).get("product"),
                             "nickname": item.get("price", {}).get("nickname"),
                         })
+
+                    # Also fetch the latest invoice to check invoice-level discount
+                    invoice_discount = None
+                    invoice_promo = None
+                    latest_invoice_id = sub.get("latest_invoice")
+                    if latest_invoice_id and isinstance(latest_invoice_id, str):
+                        inv_r = requests.get(
+                            f"https://api.stripe.com/v1/invoices/{latest_invoice_id}",
+                            params={"expand[]": "discount.promotion_code"},
+                            auth=(STRIPE_SECRET_KEY, ""),
+                            timeout=10,
+                        )
+                        if inv_r.ok:
+                            inv = inv_r.json()
+                            invoice_discount = inv.get("discount")
+                            # Also check top-level promo fields Stripe sometimes uses
+                            invoice_promo = inv.get("promotion_code")
+
                     cust_info["subscriptions"].append({
                         "sub_id": sub.get("id"),
                         "status": sub.get("status"),
                         "sub_discount": sub.get("discount"),
+                        "latest_invoice_id": latest_invoice_id,
+                        "invoice_discount": invoice_discount,
+                        "invoice_promo_code_field": invoice_promo,
                         "items": items_summary,
                     })
 
