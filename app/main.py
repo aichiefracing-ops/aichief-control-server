@@ -516,6 +516,33 @@ def admin_unkill(
     return {"ok": True, "unkilled": ver, "current_list": kill_list}
 
 
+
+
+class AffiliateRecordIn(BaseModel):
+    email: str
+    code: str
+    tier: str = "pro"
+
+
+@app.post("/admin/affiliates/record")
+def admin_affiliate_record(
+    body: AffiliateRecordIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """Manually record an affiliate — used by dashboard Sync from Stripe button."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    code = (body.code or "").strip().upper()
+    email = (body.email or "").strip().lower()
+    tier = (body.tier or "pro").strip().lower()
+    if not code or not email:
+        raise HTTPException(status_code=400, detail="email and code required")
+    _record_affiliate(email, code, tier)
+    return {"ok": True, "email": email, "code": code, "tier": tier}
+
 @app.get("/admin/affiliates")
 def admin_affiliates(
     x_aichief_key: Optional[str] = Header(default=None),
