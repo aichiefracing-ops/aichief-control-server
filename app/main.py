@@ -16,22 +16,21 @@ APP_VERSION = "0.2.3"
 DATA_DIR = Path(os.getenv("DATA_DIR") or ".")
 SETTINGS_PATH = DATA_DIR / "settings.json"
 INSTALLS_PATH = DATA_DIR / "installs.json"
+AFFILIATES_PATH = DATA_DIR / "affiliates.json"
 
 CONTROL_API_KEY = (os.getenv("CONTROL_API_KEY") or "").strip()
 
 # ── Stripe license lookup ──────────────────────────────────────
-STRIPE_SECRET_KEY = "sk_test_51T3LmN3f3LDJjQPWDXkk1d1VBOR560xsEr7i1js8mpKB2fIRkR8WhexMCgp33OmrxIuSXHpRwRGUl2jx14kZDhiK00WyABdKN9"   # ← paste your key here
+# Set STRIPE_SECRET_KEY as a Railway environment variable
+STRIPE_SECRET_KEY = (os.getenv("STRIPE_SECRET_KEY") or "").strip()
 
-# Paste your Price IDs from Stripe Dashboard → Products → your plan → Price ID
-# Looks like: price_1ABC123xyz
-# Add both monthly and annual if you have them
 STRIPE_PRO_IDS = [
-    "prod_U1OcSXed9tZOl4",   # Pro monthly
-    "prod_U1Oib1TWuA2U4r",   # Pro annual (if applicable)
+    "prod_U1OcSXed9tZOl4",
+    "prod_U1Oib1TWuA2U4r",
 ]
 STRIPE_PRO_PLUS_IDS = [
-    "prod_U1OeXZPAcV8j3p",   # Pro Plus monthly
-    "prod_U1OkjYcecOg7Gz",   # Pro Plus annual (if applicable)
+    "prod_U1OeXZPAcV8j3p",
+    "prod_U1OkjYcecOg7Gz",
 ]
 # ──────────────────────────────────────────────────────────────
 
@@ -83,6 +82,47 @@ def _require_admin(
 
     if not token or token != CONTROL_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# -------------------------
+# Affiliate helpers
+# -------------------------
+def _extract_promo_code(sub: dict) -> Optional[str]:
+    """Pull promo code off a Stripe subscription object if present."""
+    try:
+        discount = sub.get("discount") or {}
+        coupon = discount.get("coupon") or {}
+        name = coupon.get("name") or coupon.get("id") or ""
+        return name.strip().upper() or None
+    except Exception:
+        return None
+
+
+def _record_affiliate(email: str, code: Optional[str], tier: str) -> None:
+    """Log affiliate code usage to affiliates.json."""
+    if not code:
+        return
+    try:
+        data = _load_json(AFFILIATES_PATH, {})
+        if code not in data:
+            data[code] = {"code": code, "subs": []}
+        subs = data[code]["subs"]
+        existing = next((s for s in subs if s.get("email") == email), None)
+        if existing:
+            existing["tier"] = tier
+            existing["last_seen"] = _now()
+        else:
+            subs.append({
+                "email": email,
+                "tier": tier,
+                "first_seen": _now(),
+                "last_seen": _now(),
+            })
+        data[code]["total"] = len(subs)
+        _save_json(AFFILIATES_PATH, data)
+        print(f"[affiliate] recorded code={code} email={email} tier={tier}")
+    except Exception as e:
+        print(f"[affiliate] record failed: {e}")
 
 
 # -------------------------
@@ -214,12 +254,11 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
     if not email:
         return {"tier": "free"}
 
-    if not STRIPE_SECRET_KEY or STRIPE_SECRET_KEY.startswith("sk_live_XXXX"):
-        print("[license] WARN: Stripe key not configured — returning free")
+    if not STRIPE_SECRET_KEY:
+        print("[license] WARN: STRIPE_SECRET_KEY not set — returning free")
         return {"tier": "free"}
 
     try:
-        # Look up customer by email
         r = requests.get(
             "https://api.stripe.com/v1/customers",
             params={"email": email, "limit": 5},
@@ -234,7 +273,6 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
         if not customers:
             return {"tier": "free", "email": email}
 
-        # Check each customer's active subscriptions
         for customer in customers:
             cid = customer.get("id")
             if not cid:
@@ -255,14 +293,17 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
                     price_id = item.get("price", {}).get("id", "")
                     product_id = item.get("price", {}).get("product", "")
 
-                    # Pro Plus wins over Pro — check it first
                     if price_id in STRIPE_PRO_PLUS_IDS or product_id in STRIPE_PRO_PLUS_IDS:
-                        print(f"[license] {email} → pro_plus (price={price_id})")
-                        return {"tier": "pro_plus", "email": email}
+                        code = _extract_promo_code(sub)
+                        _record_affiliate(email, code, "pro_plus")
+                        print(f"[license] {email} → pro_plus code={code}")
+                        return {"tier": "pro_plus", "email": email, "affiliate_code": code}
 
                     if price_id in STRIPE_PRO_IDS or product_id in STRIPE_PRO_IDS:
-                        print(f"[license] {email} → pro (price={price_id})")
-                        return {"tier": "pro", "email": email}
+                        code = _extract_promo_code(sub)
+                        _record_affiliate(email, code, "pro")
+                        print(f"[license] {email} → pro code={code}")
+                        return {"tier": "pro", "email": email, "affiliate_code": code}
 
         print(f"[license] {email} → free (no matching active sub)")
         return {"tier": "free", "email": email}
@@ -388,6 +429,32 @@ def admin_unkill(
         settings["kill_list"] = kill_list
         _save_json(SETTINGS_PATH, settings)
     return {"ok": True, "unkilled": ver, "current_list": kill_list}
+
+
+@app.get("/admin/affiliates")
+def admin_affiliates(
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    data = _load_json(AFFILIATES_PATH, {})
+    summary = []
+    for code, info in data.items():
+        subs = info.get("subs", [])
+        pro_count = sum(1 for s in subs if s.get("tier") == "pro")
+        pro_plus_count = sum(1 for s in subs if s.get("tier") == "pro_plus")
+        summary.append({
+            "code": code,
+            "total": info.get("total", 0),
+            "pro": pro_count,
+            "pro_plus": pro_plus_count,
+            "subs": subs,
+        })
+    summary.sort(key=lambda x: x["total"], reverse=True)
+    return {"ok": True, "affiliates": summary}
 
 
 @app.post("/tts/stream")
