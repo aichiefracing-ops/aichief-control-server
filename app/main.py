@@ -87,37 +87,20 @@ def _require_admin(
 # -------------------------
 # Affiliate helpers
 # -------------------------
-def _extract_promo_code(sub: dict, customer: Optional[dict] = None) -> Optional[str]:
-    """Pull promo code off a Stripe subscription or customer object.
-
-    Stripe sometimes attaches the discount to the customer rather than the
-    subscription, so we check both.
-    """
-    def _read_discount(discount: dict) -> Optional[str]:
-        if not discount:
-            return None
-        # promotion_code expanded object — has the actual code string
+def _extract_promo_code(sub: dict) -> Optional[str]:
+    """Pull promo code off a Stripe subscription object if present."""
+    try:
+        discount = sub.get("discount") or {}
+        # Try promotion_code first (the actual code the customer typed)
         promo = discount.get("promotion_code")
         if isinstance(promo, dict):
             code = promo.get("code") or ""
             if code:
                 return code.strip().upper()
-        # promotion_code as bare ID string — not much use but try coupon name
+        # Fall back to coupon name if promotion_code not expanded
         coupon = discount.get("coupon") or {}
         name = coupon.get("name") or coupon.get("id") or ""
         return name.strip().upper() or None
-
-    try:
-        # Check subscription-level discount first
-        result = _read_discount(sub.get("discount") or {})
-        if result:
-            return result
-        # Fall back to customer-level discount (Stripe often puts it here)
-        if customer and isinstance(customer, dict):
-            result = _read_discount(customer.get("discount") or {})
-            if result:
-                return result
-        return None
     except Exception:
         return None
 
@@ -285,7 +268,7 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
     try:
         r = requests.get(
             "https://api.stripe.com/v1/customers",
-            params={"email": email, "limit": 5, "expand[]": "data.discount.promotion_code"},
+            params={"email": email, "limit": 5},
             auth=(STRIPE_SECRET_KEY, ""),
             timeout=8,
         )
@@ -318,13 +301,13 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
                     product_id = item.get("price", {}).get("product", "")
 
                     if price_id in STRIPE_PRO_PLUS_IDS or product_id in STRIPE_PRO_PLUS_IDS:
-                        code = _extract_promo_code(sub, customer)
+                        code = _extract_promo_code(sub)
                         _record_affiliate(email, code, "pro_plus")
                         print(f"[license] {email} → pro_plus code={code}")
                         return {"tier": "pro_plus", "email": email, "affiliate_code": code}
 
                     if price_id in STRIPE_PRO_IDS or product_id in STRIPE_PRO_IDS:
-                        code = _extract_promo_code(sub, customer)
+                        code = _extract_promo_code(sub)
                         _record_affiliate(email, code, "pro")
                         print(f"[license] {email} → pro code={code}")
                         return {"tier": "pro", "email": email, "affiliate_code": code}
@@ -480,6 +463,83 @@ def admin_affiliates(
     summary.sort(key=lambda x: x["total"], reverse=True)
     return {"ok": True, "affiliates": summary}
 
+
+
+
+class DebugLicenseIn(BaseModel):
+    email: str
+
+
+@app.post("/admin/debug/stripe")
+def debug_stripe(
+    body: DebugLicenseIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """Debug endpoint — dumps raw Stripe customer + subscription objects for an email."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+
+    if not STRIPE_SECRET_KEY:
+        return {"error": "STRIPE_SECRET_KEY not set"}
+
+    email = (body.email or "").strip().lower()
+    result: Dict[str, Any] = {"email": email, "customers": []}
+
+    try:
+        r = requests.get(
+            "https://api.stripe.com/v1/customers",
+            params={"email": email, "limit": 5, "expand[]": "data.discount.promotion_code"},
+            auth=(STRIPE_SECRET_KEY, ""),
+            timeout=10,
+        )
+        customers = r.json().get("data", []) if r.ok else []
+
+        for customer in customers:
+            cid = customer.get("id")
+            cust_info = {
+                "id": cid,
+                "email": customer.get("email"),
+                "name": customer.get("name"),
+                "customer_discount": customer.get("discount"),
+                "subscriptions": [],
+            }
+
+            subs_r = requests.get(
+                "https://api.stripe.com/v1/subscriptions",
+                params={
+                    "customer": cid,
+                    "status": "active",
+                    "limit": 10,
+                    "expand[]": "data.discount.promotion_code",
+                },
+                auth=(STRIPE_SECRET_KEY, ""),
+                timeout=10,
+            )
+            if subs_r.ok:
+                for sub in subs_r.json().get("data", []):
+                    items_summary = []
+                    for item in sub.get("items", {}).get("data", []):
+                        items_summary.append({
+                            "price_id": item.get("price", {}).get("id"),
+                            "product_id": item.get("price", {}).get("product"),
+                            "nickname": item.get("price", {}).get("nickname"),
+                        })
+                    cust_info["subscriptions"].append({
+                        "sub_id": sub.get("id"),
+                        "status": sub.get("status"),
+                        "sub_discount": sub.get("discount"),
+                        "items": items_summary,
+                    })
+
+            result["customers"].append(cust_info)
+
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
 
 @app.post("/tts/stream")
 def tts_stream(
