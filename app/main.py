@@ -91,6 +91,13 @@ def _extract_promo_code(sub: dict) -> Optional[str]:
     """Pull promo code off a Stripe subscription object if present."""
     try:
         discount = sub.get("discount") or {}
+        # Try promotion_code first (the actual code the customer typed)
+        promo = discount.get("promotion_code")
+        if isinstance(promo, dict):
+            code = promo.get("code") or ""
+            if code:
+                return code.strip().upper()
+        # Fall back to coupon name if promotion_code not expanded
         coupon = discount.get("coupon") or {}
         name = coupon.get("name") or coupon.get("id") or ""
         return name.strip().upper() or None
@@ -280,7 +287,7 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
 
             subs_r = requests.get(
                 "https://api.stripe.com/v1/subscriptions",
-                params={"customer": cid, "status": "active", "limit": 10},
+                params={"customer": cid, "status": "active", "limit": 10, "expand[]": "data.discount.promotion_code"},
                 auth=(STRIPE_SECRET_KEY, ""),
                 timeout=8,
             )
