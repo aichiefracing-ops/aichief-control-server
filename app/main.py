@@ -19,6 +19,22 @@ INSTALLS_PATH = DATA_DIR / "installs.json"
 
 CONTROL_API_KEY = (os.getenv("CONTROL_API_KEY") or "").strip()
 
+# ── Stripe license lookup ──────────────────────────────────────
+STRIPE_SECRET_KEY = "sk_test_51T3LmN3f3LDJjQPWDXkk1d1VBOR560xsEr7i1js8mpKB2fIRkR8WhexMCgp33OmrxIuSXHpRwRGUl2jx14kZDhiK00WyABdKN9"   # ← paste your key here
+
+# Paste your Price IDs from Stripe Dashboard → Products → your plan → Price ID
+# Looks like: price_1ABC123xyz
+# Add both monthly and annual if you have them
+STRIPE_PRO_IDS = [
+    "prod_U1OcSXed9tZOl4",   # Pro monthly
+    "prod_U1Oib1TWuA2U4r",   # Pro annual (if applicable)
+]
+STRIPE_PRO_PLUS_IDS = [
+    "prod_U1OeXZPAcV8j3p",   # Pro Plus monthly
+    "prod_U1OkjYcecOg7Gz",   # Pro Plus annual (if applicable)
+]
+# ──────────────────────────────────────────────────────────────
+
 app = FastAPI(title="AI Chief Control Server", version=APP_VERSION)
 
 
@@ -50,9 +66,6 @@ def _require_admin(
     x_api_key: Optional[str],
     control_api_key: Optional[str],
 ) -> None:
-    """
-    Accept admin auth from any of these headers.
-    """
     if not CONTROL_API_KEY:
         raise HTTPException(status_code=500, detail="CONTROL_API_KEY not set on server")
 
@@ -81,7 +94,7 @@ class RegisterIn(BaseModel):
     user: Optional[str] = None
     version: Optional[str] = None
     channel: Optional[str] = "beta"
-    
+
 class TtsIn(BaseModel):
     text: str
     accept: Optional[str] = "audio/wav"
@@ -100,11 +113,7 @@ class AdminSettings(BaseModel):
     latest_version: str = "0.0.0"
     patch_url: Optional[str] = None
     force_update: bool = False
-    
-    # New Kill List support
     kill_list: List[str] = []
-
-    # --- Garage Info (client UI) ---
     garage_status: str = ""
     garage_note: str = ""
     garage_subnote: str = ""
@@ -115,6 +124,9 @@ class KillIn(BaseModel):
 class UnkillIn(BaseModel):
     version: str
 
+class LicenseCheckIn(BaseModel):
+    email: str
+
 
 # -------------------------
 # Boot defaults
@@ -124,9 +136,7 @@ DEFAULT_SETTINGS = {
     "latest_version": "0.0.0",
     "patch_url": None,
     "force_update": False,
-    "kill_list": [],  # List of strings ["1.0.6", "1.0.5"]
-
-    # --- Garage Info (client UI) ---
+    "kill_list": [],
     "garage_status": "",
     "garage_note": "",
     "garage_subnote": "",
@@ -143,28 +153,14 @@ def root() -> Dict[str, Any]:
 # -------------------------
 # Public APIs (Client Calls)
 # -------------------------
-
-# --- THIS IS THE NEW ENDPOINT THE CLIENT NEEDS ---
 @app.get("/settings")
 def get_settings(x_aichief_key: Optional[str] = Header(None, alias="x-aichief-key")):
-    """
-    Public endpoint for clients to pull Latest Version, Garage Info, and Kill List.
-    No strict auth required (clients need to know if they are dead).
-    """
     current = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
-    
-    # Safety: ensure list exists
     if "kill_list" not in current:
         current["kill_list"] = []
-        
-    # Filter out sensitive admin stuff if you add any later
-    # For now, sending the whole settings object is fine
     return current
 
 
-# -------------------------
-# Client policy (Legacy Support for 1.0.6 and older)
-# -------------------------
 @app.post("/client/config")
 def client_config(body: ClientConfigIn) -> Dict[str, Any]:
     settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
@@ -173,36 +169,27 @@ def client_config(body: ClientConfigIn) -> Dict[str, Any]:
     latest_version = str(settings.get("latest_version", "0.0.0"))
     patch_url = settings.get("patch_url")
     force_update = bool(settings.get("force_update", False))
-    
-    # Garage info
     garage_status = str(settings.get("garage_status", ""))
     garage_note = str(settings.get("garage_note", ""))
     garage_subnote = str(settings.get("garage_subnote", ""))
 
-    # --- CRITICAL FIX: Check the NEW Kill List ---
-    # Old clients don't know about "kill_list", so we must check it for them here
-    # and return the result as 'should_lock'.
     kill_list = settings.get("kill_list", [])
     safe_kill_list = [str(k).strip() for k in kill_list]
 
     should_lock = False
     reason = None
 
-    # 1. Global Beta Lock
     if not beta_enabled:
         should_lock = True
         reason = "Beta is currently disabled."
 
-    # 2. Version Kill Switch (The Fix)
     if str(body.version) in safe_kill_list:
         should_lock = True
         reason = f"This build ({body.version}) has been disabled.\nPlease update."
 
-    # 3. Force Update
     if force_update and latest_version and body.version != latest_version:
         should_lock = True
         reason = f"Update required. Your version {body.version} is behind."
-    
 
     return {
         "ok": True,
@@ -210,14 +197,80 @@ def client_config(body: ClientConfigIn) -> Dict[str, Any]:
         "latest_version": latest_version,
         "patch_url": patch_url,
         "force_update": force_update,
-        "should_lock": should_lock,  # <--- Old client reads this
-        "reason": reason or "",      # <--- Old client reads this
-    
-        # --- Garage Info (sent to UI) ---
+        "should_lock": should_lock,
+        "reason": reason or "",
         "garage_status": garage_status,
         "garage_note": garage_note,
         "garage_subnote": garage_subnote,
     }
+
+
+# -------------------------
+# License Check
+# -------------------------
+@app.post("/license/check")
+def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
+    email = (body.email or "").strip().lower()
+    if not email:
+        return {"tier": "free"}
+
+    if not STRIPE_SECRET_KEY or STRIPE_SECRET_KEY.startswith("sk_live_XXXX"):
+        print("[license] WARN: Stripe key not configured — returning free")
+        return {"tier": "free"}
+
+    try:
+        # Look up customer by email
+        r = requests.get(
+            "https://api.stripe.com/v1/customers",
+            params={"email": email, "limit": 5},
+            auth=(STRIPE_SECRET_KEY, ""),
+            timeout=8,
+        )
+        if not r.ok:
+            print(f"[license] Stripe customer lookup failed: {r.status_code}")
+            return {"tier": "free"}
+
+        customers = r.json().get("data", [])
+        if not customers:
+            return {"tier": "free", "email": email}
+
+        # Check each customer's active subscriptions
+        for customer in customers:
+            cid = customer.get("id")
+            if not cid:
+                continue
+
+            subs_r = requests.get(
+                "https://api.stripe.com/v1/subscriptions",
+                params={"customer": cid, "status": "active", "limit": 10},
+                auth=(STRIPE_SECRET_KEY, ""),
+                timeout=8,
+            )
+            if not subs_r.ok:
+                continue
+
+            subs = subs_r.json().get("data", [])
+            for sub in subs:
+                for item in sub.get("items", {}).get("data", []):
+                    price_id = item.get("price", {}).get("id", "")
+                    product_id = item.get("price", {}).get("product", "")
+
+                    # Pro Plus wins over Pro — check it first
+                    if price_id in STRIPE_PRO_PLUS_IDS or product_id in STRIPE_PRO_PLUS_IDS:
+                        print(f"[license] {email} → pro_plus (price={price_id})")
+                        return {"tier": "pro_plus", "email": email}
+
+                    if price_id in STRIPE_PRO_IDS or product_id in STRIPE_PRO_IDS:
+                        print(f"[license] {email} → pro (price={price_id})")
+                        return {"tier": "pro", "email": email}
+
+        print(f"[license] {email} → free (no matching active sub)")
+        return {"tier": "free", "email": email}
+
+    except Exception as e:
+        print(f"[license] Stripe lookup exception: {e}")
+        return {"tier": "free"}
+
 
 # -------------------------
 # Install APIs
@@ -250,7 +303,7 @@ def install_heartbeat(body: HeartbeatIn) -> Dict[str, Any]:
 
 
 # -------------------------
-# Admin APIs (Admin Dashboard Calls)
+# Admin APIs
 # -------------------------
 @app.get("/admin/settings")
 def admin_get_settings(
@@ -262,12 +315,10 @@ def admin_get_settings(
 ) -> Dict[str, Any]:
     _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
     settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
-    
-    # Ensure kill_list is present for the UI
     if "kill_list" not in settings:
         settings["kill_list"] = []
-        
     return settings
+
 
 @app.post("/admin/settings")
 def admin_set_settings(
@@ -280,11 +331,7 @@ def admin_set_settings(
 ) -> Dict[str, Any]:
     _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
     settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
-    
-    # Clean update
-    update_data = body.model_dump()
-    settings.update(update_data)
-    
+    settings.update(body.model_dump())
     _save_json(SETTINGS_PATH, settings)
     return {"ok": True}
 
@@ -313,16 +360,13 @@ def admin_kill(
     control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
 ) -> Dict[str, Any]:
     _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
-    
     settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
     kill_list = settings.get("kill_list", [])
-    
     ver = str(body.version).strip()
     if ver and ver not in kill_list:
         kill_list.append(ver)
         settings["kill_list"] = kill_list
         _save_json(SETTINGS_PATH, settings)
-        
     return {"ok": True, "killed": ver, "current_list": kill_list}
 
 
@@ -336,16 +380,13 @@ def admin_unkill(
     control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
 ) -> Dict[str, Any]:
     _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
-    
     settings = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
     kill_list = settings.get("kill_list", [])
-    
     ver = str(body.version).strip()
     if ver in kill_list:
         kill_list.remove(ver)
         settings["kill_list"] = kill_list
         _save_json(SETTINGS_PATH, settings)
-        
     return {"ok": True, "unkilled": ver, "current_list": kill_list}
 
 
@@ -358,7 +399,6 @@ def tts_stream(
     x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
     control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
 ):
-    # protect your credits
     _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
 
     text = (body.text or "").strip()
@@ -372,13 +412,10 @@ def tts_stream(
     if not api_key or not voice_id:
         raise HTTPException(status_code=500, detail="Missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID")
 
-    # -----------------------------------------------------------
-    # We ask 11Labs for MP3 (standard), but client converts to WAV
-    # -----------------------------------------------------------
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
     headers = {
         "xi-api-key": api_key,
-        "Accept": "audio/mpeg", 
+        "Accept": "audio/mpeg",
         "Content-Type": "application/json",
     }
     payload = {
