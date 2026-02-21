@@ -528,30 +528,36 @@ def debug_stripe(
                             "nickname": item.get("price", {}).get("nickname"),
                         })
 
-                    # Also fetch the latest invoice to check invoice-level discount
-                    invoice_discount = None
-                    invoice_promo = None
+                    # Fetch latest invoice — check discount (singular) AND discounts (plural array)
+                    invoice_info = None
                     latest_invoice_id = sub.get("latest_invoice")
                     if latest_invoice_id and isinstance(latest_invoice_id, str):
                         inv_r = requests.get(
                             f"https://api.stripe.com/v1/invoices/{latest_invoice_id}",
-                            params={"expand[]": "discount.promotion_code"},
+                            params=[
+                                ("expand[]", "discount.promotion_code"),
+                                ("expand[]", "discounts.promotion_code"),
+                            ],
                             auth=(STRIPE_SECRET_KEY, ""),
                             timeout=10,
                         )
                         if inv_r.ok:
                             inv = inv_r.json()
-                            invoice_discount = inv.get("discount")
-                            # Also check top-level promo fields Stripe sometimes uses
-                            invoice_promo = inv.get("promotion_code")
+                            invoice_info = {
+                                "discount_singular": inv.get("discount"),
+                                "discounts_plural": inv.get("discounts"),
+                                "total_discount_amounts": inv.get("total_discount_amounts"),
+                                "subtotal": inv.get("subtotal"),
+                                "total": inv.get("total"),
+                            }
 
                     cust_info["subscriptions"].append({
                         "sub_id": sub.get("id"),
                         "status": sub.get("status"),
-                        "sub_discount": sub.get("discount"),
+                        "sub_discount_singular": sub.get("discount"),
+                        "sub_discounts_plural": sub.get("discounts"),
                         "latest_invoice_id": latest_invoice_id,
-                        "invoice_discount": invoice_discount,
-                        "invoice_promo_code_field": invoice_promo,
+                        "invoice_info": invoice_info,
                         "items": items_summary,
                     })
 
