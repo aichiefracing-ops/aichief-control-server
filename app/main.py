@@ -87,20 +87,98 @@ def _require_admin(
 # -------------------------
 # Affiliate helpers
 # -------------------------
-def _extract_promo_code(sub: dict) -> Optional[str]:
-    """Pull promo code off a Stripe subscription object if present."""
+def _fetch_coupon_name(coupon_id: str) -> Optional[str]:
+    """Look up a Stripe coupon by ID and return its name."""
     try:
+        r = requests.get(
+            f"https://api.stripe.com/v1/coupons/{coupon_id}",
+            auth=(STRIPE_SECRET_KEY, ""),
+            timeout=6,
+        )
+        if r.ok:
+            data = r.json()
+            name = data.get("name") or data.get("id") or ""
+            return name.strip().upper() or None
+    except Exception:
+        pass
+    return None
+
+
+def _extract_promo_code_from_invoice(invoice_id: str) -> Optional[str]:
+    """Fetch a Stripe invoice and extract the affiliate code from discounts array."""
+    try:
+        inv_r = requests.get(
+            f"https://api.stripe.com/v1/invoices/{invoice_id}",
+            params=[("expand[]", "discounts")],
+            auth=(STRIPE_SECRET_KEY, ""),
+            timeout=6,
+        )
+        if not inv_r.ok:
+            return None
+        inv = inv_r.json()
+        discounts = inv.get("discounts") or []
+        for d in discounts:
+            if not isinstance(d, dict):
+                continue
+            # Check promotion_code path first
+            promo = d.get("promotion_code")
+            if isinstance(promo, dict):
+                code = promo.get("code") or ""
+                if code:
+                    return code.strip().upper()
+            # Check source.coupon path (how Stripe returns it in newer API)
+            source = d.get("source") or {}
+            if source.get("type") == "coupon":
+                coupon_id = source.get("coupon") or ""
+                if coupon_id:
+                    return _fetch_coupon_name(coupon_id)
+            # Direct coupon object
+            coupon = d.get("coupon") or {}
+            if coupon:
+                name = coupon.get("name") or coupon.get("id") or ""
+                if name:
+                    return name.strip().upper()
+    except Exception:
+        pass
+    return None
+
+
+def _extract_promo_code(sub: dict, customer: Optional[dict] = None) -> Optional[str]:
+    """Extract affiliate code from a subscription, trying all known Stripe discount paths."""
+    try:
+        # Path 1: sub.discount.promotion_code (classic path)
         discount = sub.get("discount") or {}
-        # Try promotion_code first (the actual code the customer typed)
         promo = discount.get("promotion_code")
         if isinstance(promo, dict):
             code = promo.get("code") or ""
             if code:
                 return code.strip().upper()
-        # Fall back to coupon name if promotion_code not expanded
         coupon = discount.get("coupon") or {}
-        name = coupon.get("name") or coupon.get("id") or ""
-        return name.strip().upper() or None
+        name = coupon.get("name") or ""
+        if name:
+            return name.strip().upper()
+
+        # Path 2: customer.discount (Stripe sometimes puts it here)
+        if customer and isinstance(customer, dict):
+            cdiscount = customer.get("discount") or {}
+            promo = cdiscount.get("promotion_code")
+            if isinstance(promo, dict):
+                code = promo.get("code") or ""
+                if code:
+                    return code.strip().upper()
+            coupon = cdiscount.get("coupon") or {}
+            name = coupon.get("name") or ""
+            if name:
+                return name.strip().upper()
+
+        # Path 3: invoice.discounts[].source.coupon (newest Stripe API — what we actually see)
+        latest_invoice = sub.get("latest_invoice")
+        if latest_invoice and isinstance(latest_invoice, str):
+            code = _extract_promo_code_from_invoice(latest_invoice)
+            if code:
+                return code
+
+        return None
     except Exception:
         return None
 
@@ -301,13 +379,13 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
                     product_id = item.get("price", {}).get("product", "")
 
                     if price_id in STRIPE_PRO_PLUS_IDS or product_id in STRIPE_PRO_PLUS_IDS:
-                        code = _extract_promo_code(sub)
+                        code = _extract_promo_code(sub, customer)
                         _record_affiliate(email, code, "pro_plus")
                         print(f"[license] {email} → pro_plus code={code}")
                         return {"tier": "pro_plus", "email": email, "affiliate_code": code}
 
                     if price_id in STRIPE_PRO_IDS or product_id in STRIPE_PRO_IDS:
-                        code = _extract_promo_code(sub)
+                        code = _extract_promo_code(sub, customer)
                         _record_affiliate(email, code, "pro")
                         print(f"[license] {email} → pro code={code}")
                         return {"tier": "pro", "email": email, "affiliate_code": code}
