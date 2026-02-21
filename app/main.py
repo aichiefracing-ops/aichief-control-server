@@ -87,20 +87,37 @@ def _require_admin(
 # -------------------------
 # Affiliate helpers
 # -------------------------
-def _extract_promo_code(sub: dict) -> Optional[str]:
-    """Pull promo code off a Stripe subscription object if present."""
-    try:
-        discount = sub.get("discount") or {}
-        # Try promotion_code first (the actual code the customer typed)
+def _extract_promo_code(sub: dict, customer: Optional[dict] = None) -> Optional[str]:
+    """Pull promo code off a Stripe subscription or customer object.
+
+    Stripe sometimes attaches the discount to the customer rather than the
+    subscription, so we check both.
+    """
+    def _read_discount(discount: dict) -> Optional[str]:
+        if not discount:
+            return None
+        # promotion_code expanded object — has the actual code string
         promo = discount.get("promotion_code")
         if isinstance(promo, dict):
             code = promo.get("code") or ""
             if code:
                 return code.strip().upper()
-        # Fall back to coupon name if promotion_code not expanded
+        # promotion_code as bare ID string — not much use but try coupon name
         coupon = discount.get("coupon") or {}
         name = coupon.get("name") or coupon.get("id") or ""
         return name.strip().upper() or None
+
+    try:
+        # Check subscription-level discount first
+        result = _read_discount(sub.get("discount") or {})
+        if result:
+            return result
+        # Fall back to customer-level discount (Stripe often puts it here)
+        if customer and isinstance(customer, dict):
+            result = _read_discount(customer.get("discount") or {})
+            if result:
+                return result
+        return None
     except Exception:
         return None
 
@@ -268,7 +285,7 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
     try:
         r = requests.get(
             "https://api.stripe.com/v1/customers",
-            params={"email": email, "limit": 5},
+            params={"email": email, "limit": 5, "expand[]": "data.discount.promotion_code"},
             auth=(STRIPE_SECRET_KEY, ""),
             timeout=8,
         )
@@ -301,13 +318,13 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
                     product_id = item.get("price", {}).get("product", "")
 
                     if price_id in STRIPE_PRO_PLUS_IDS or product_id in STRIPE_PRO_PLUS_IDS:
-                        code = _extract_promo_code(sub)
+                        code = _extract_promo_code(sub, customer)
                         _record_affiliate(email, code, "pro_plus")
                         print(f"[license] {email} → pro_plus code={code}")
                         return {"tier": "pro_plus", "email": email, "affiliate_code": code}
 
                     if price_id in STRIPE_PRO_IDS or product_id in STRIPE_PRO_IDS:
-                        code = _extract_promo_code(sub)
+                        code = _extract_promo_code(sub, customer)
                         _record_affiliate(email, code, "pro")
                         print(f"[license] {email} → pro code={code}")
                         return {"tier": "pro", "email": email, "affiliate_code": code}
