@@ -25,8 +25,8 @@ CONTROL_API_KEY = (os.getenv("CONTROL_API_KEY") or "").strip()
 STRIPE_SECRET_KEY = (os.getenv("STRIPE_SECRET_KEY") or "").strip()
 
 STRIPE_PRO_IDS = [
-    "prod_U1OcSXed9tZOl4",
-    "prod_U1Oib1TWuA2U4r",
+    "prod_U3xVv4KtiMXTyp",
+    "prod_U3xVAtBHDwLdrn",
 ]
 STRIPE_PRO_PLUS_IDS = [
     "prod_U1OeXZPAcV8j3p",
