@@ -17,6 +17,7 @@ DATA_DIR = Path(os.getenv("DATA_DIR") or ".")
 SETTINGS_PATH = DATA_DIR / "settings.json"
 INSTALLS_PATH = DATA_DIR / "installs.json"
 AFFILIATES_PATH = DATA_DIR / "affiliates.json"
+PRIME_PATH = DATA_DIR / "prime_sessions.jsonl"
 
 CONTROL_API_KEY = (os.getenv("CONTROL_API_KEY") or "").strip()
 
@@ -613,3 +614,50 @@ def tts_stream(
         raise HTTPException(status_code=502, detail=f"ElevenLabs failed status={r.status_code}")
 
     return Response(content=r.content, media_type="audio/mpeg")
+
+
+# ─────────────────────────────────────────────
+# Chief Prime — Session ingestion
+# ─────────────────────────────────────────────
+
+class PrimeSessionIn(BaseModel):
+    v: str
+    uuid: str
+    session: Dict[str, Any]
+    finish: Dict[str, Any]
+    events: List[Dict[str, Any]]
+
+
+@app.post("/prime/session")
+def prime_session(body: PrimeSessionIn) -> Dict[str, Any]:
+    """
+    Receive a session batch from prime_logger.
+    Appended as a single JSONL line to prime_sessions.jsonl.
+    One line per session. Never blocks the client.
+    """
+    try:
+        # Basic sanity — reject empty or obviously bad payloads
+        if not body.uuid or len(body.uuid) < 8:
+            raise HTTPException(status_code=400, detail="invalid uuid")
+
+        record = {
+            "ts": _now(),
+            "v": body.v,
+            "uuid": body.uuid,
+            "session": body.session,
+            "finish": body.finish,
+            "event_count": len(body.events),
+            "events": body.events,
+        }
+
+        PRIME_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with PRIME_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+        return {"ok": True, "events": len(body.events)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Silent to client — never surface internal errors
+        return {"ok": False, "detail": str(e)}
