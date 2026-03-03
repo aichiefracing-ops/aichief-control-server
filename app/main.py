@@ -11,6 +11,42 @@ from pydantic import BaseModel
 from fastapi import Response
 import requests
 
+# ── Postgres (Prime session storage) ──────────────────────────
+try:
+    import psycopg2
+    import psycopg2.extras
+    _PG_URL = (os.getenv("DATABASE_URL") or "").strip()
+
+    def _pg_conn():
+        return psycopg2.connect(_PG_URL, sslmode="require")
+
+    def _init_prime_table():
+        if not _PG_URL:
+            return
+        try:
+            with _pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS prime_sessions (
+                            id          SERIAL PRIMARY KEY,
+                            uuid        TEXT NOT NULL,
+                            received_at TIMESTAMPTZ DEFAULT NOW(),
+                            payload     JSONB NOT NULL
+                        );
+                        CREATE INDEX IF NOT EXISTS prime_uuid_idx ON prime_sessions(uuid);
+                    """)
+                conn.commit()
+            print("[prime] DB table ready")
+        except Exception as e:
+            print(f"[prime] DB init error: {e}")
+
+    _init_prime_table()
+    _PRIME_DB_OK = bool(_PG_URL)
+except ImportError:
+    _PRIME_DB_OK = False
+    print("[prime] psycopg2 not found — falling back to JSONL")
+# ──────────────────────────────────────────────────────────────
+
 APP_VERSION = "0.2.3"
 
 DATA_DIR = Path(os.getenv("DATA_DIR") or ".")
@@ -632,11 +668,9 @@ class PrimeSessionIn(BaseModel):
 def prime_session(body: PrimeSessionIn) -> Dict[str, Any]:
     """
     Receive a session batch from prime_logger.
-    Appended as a single JSONL line to prime_sessions.jsonl.
-    One line per session. Never blocks the client.
+    Stored in Postgres (primary) with JSONL fallback.
     """
     try:
-        # Basic sanity — reject empty or obviously bad payloads
         if not body.uuid or len(body.uuid) < 8:
             raise HTTPException(status_code=400, detail="invalid uuid")
 
@@ -650,14 +684,33 @@ def prime_session(body: PrimeSessionIn) -> Dict[str, Any]:
             "events": body.events,
         }
 
-        PRIME_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with PRIME_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        stored = False
+
+        # Primary: Postgres
+        if _PRIME_DB_OK:
+            try:
+                with _pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO prime_sessions (uuid, payload) VALUES (%s, %s)",
+                            (body.uuid, psycopg2.extras.Json(record))
+                        )
+                    conn.commit()
+                stored = True
+                print(f"[prime] stored uuid={body.uuid[:8]} events={len(body.events)}")
+            except Exception as e:
+                print(f"[prime] DB write error: {e}")
+
+        # Fallback: JSONL
+        if not stored:
+            PRIME_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with PRIME_PATH.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
+            print(f"[prime] JSONL fallback uuid={body.uuid[:8]} events={len(body.events)}")
 
         return {"ok": True, "events": len(body.events)}
 
     except HTTPException:
         raise
     except Exception as e:
-        # Silent to client — never surface internal errors
         return {"ok": False, "detail": str(e)}
