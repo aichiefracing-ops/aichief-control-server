@@ -69,6 +69,8 @@ STRIPE_PRO_PLUS_IDS = [
     "prod_U1OeXZPAcV8j3p",
     "prod_U1OkjYcecOg7Gz",
 ]
+# Dev accounts — is_dev=true returned only for these emails
+DEV_EMAILS = {"ksherman618@gmail.com"}
 # ──────────────────────────────────────────────────────────────
 
 app = FastAPI(title="AI Chief Control Server", version=APP_VERSION)
@@ -374,11 +376,11 @@ def client_config(body: ClientConfigIn) -> Dict[str, Any]:
 def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
     email = (body.email or "").strip().lower()
     if not email:
-        return {"tier": "free"}
+        return {"tier": "free", "is_dev": False}
 
     if not STRIPE_SECRET_KEY:
         print("[license] WARN: STRIPE_SECRET_KEY not set — returning free")
-        return {"tier": "free"}
+        return {"tier": "free", "is_dev": email in DEV_EMAILS}
 
     try:
         r = requests.get(
@@ -389,11 +391,11 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
         )
         if not r.ok:
             print(f"[license] Stripe customer lookup failed: {r.status_code}")
-            return {"tier": "free"}
+            return {"tier": "free", "is_dev": email in DEV_EMAILS}
 
         customers = r.json().get("data", [])
         if not customers:
-            return {"tier": "free", "email": email}
+            return {"tier": "free", "email": email, "is_dev": email in DEV_EMAILS}
 
         for customer in customers:
             cid = customer.get("id")
@@ -419,20 +421,20 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
                         code = _extract_promo_code(sub, customer)
                         _record_affiliate(email, code, "pro_plus")
                         print(f"[license] {email} → pro_plus code={code}")
-                        return {"tier": "pro_plus", "email": email, "affiliate_code": code}
+                        return {"tier": "pro_plus", "email": email, "affiliate_code": code, "is_dev": email in DEV_EMAILS}
 
                     if price_id in STRIPE_PRO_IDS or product_id in STRIPE_PRO_IDS:
                         code = _extract_promo_code(sub, customer)
                         _record_affiliate(email, code, "pro")
                         print(f"[license] {email} → pro code={code}")
-                        return {"tier": "pro", "email": email, "affiliate_code": code}
+                        return {"tier": "pro", "email": email, "affiliate_code": code, "is_dev": email in DEV_EMAILS}
 
         print(f"[license] {email} → free (no matching active sub)")
-        return {"tier": "free", "email": email}
+        return {"tier": "free", "email": email, "is_dev": email in DEV_EMAILS}
 
     except Exception as e:
         print(f"[license] Stripe lookup exception: {e}")
-        return {"tier": "free"}
+        return {"tier": "free", "is_dev": email in DEV_EMAILS}
 
 
 # -------------------------
