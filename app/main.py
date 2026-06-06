@@ -839,9 +839,12 @@ def admin_affiliate_sub_add(
                 y, m = start_year, start_month
                 while (y, m) <= (today.year, today.month):
                     month_str = f"{y:04d}-{m:02d}"
-                    # Don't double-fire if generate-recurring already ran for this month
+                    # Don't double-fire for this specific sub+month combo
+                    sub_label = body.sub_name.strip()
                     already = any(
-                        e.get("type") == "recurring" and e.get("month") == month_str
+                        e.get("type") == "recurring"
+                        and e.get("month") == month_str
+                        and sub_label in (e.get("breakdown") or [""])[0]
                         for e in profile.get("log", [])
                     )
                     if not already:
@@ -849,7 +852,7 @@ def admin_affiliate_sub_add(
                             "type": "recurring",
                             "month": month_str,
                             "amount": rate,
-                            "breakdown": [f"{body.sub_name.strip()} ({tier}) +${rate:.2f}"],
+                            "breakdown": [f"{sub_label} ({tier}) +${rate:.2f}"],
                             "date": f"{month_str}-01",
                         })
                     m += 1
