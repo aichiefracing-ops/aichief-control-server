@@ -40,7 +40,26 @@ try:
         except Exception as e:
             print(f"[prime] DB init error: {e}")
 
+def _init_affiliate_table():
+        if not _PG_URL:
+            return
+        try:
+            with _pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS affiliate_profiles (
+                            code        TEXT PRIMARY KEY,
+                            data        JSONB NOT NULL,
+                            updated_at  TIMESTAMPTZ DEFAULT NOW()
+                        );
+                    """)
+                conn.commit()
+            print("[affiliate] DB table ready")
+        except Exception as e:
+            print(f"[affiliate] DB init error: {e}")
+
     _init_prime_table()
+    _init_affiliate_table()
     _PRIME_DB_OK = bool(_PG_URL)
 except ImportError:
     _PRIME_DB_OK = False
@@ -262,10 +281,47 @@ TIER_YEARLY_RATE = {
 }
 
 def _load_profiles() -> dict:
+    """Load all affiliate profiles. Postgres primary, JSON file fallback."""
+    if _PRIME_DB_OK:
+        try:
+            with _pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT code, data FROM affiliate_profiles;")
+                    rows = cur.fetchall()
+            if rows:
+                return {row[0]: row[1] for row in rows}
+            # No rows yet — try migrating from JSON file if it exists
+            file_data = _load_json(AFFILIATE_PROFILES_PATH, {})
+            if file_data:
+                print("[affiliate] Migrating JSON file to Postgres...")
+                _save_profiles(file_data)
+            return file_data
+        except Exception as e:
+            print(f"[affiliate] DB load error, falling back to JSON: {e}")
     return _load_json(AFFILIATE_PROFILES_PATH, {})
 
+
 def _save_profiles(data: dict) -> None:
+    """Save all affiliate profiles. Postgres primary, JSON file fallback."""
+    # Always write JSON as backup
     _save_json(AFFILIATE_PROFILES_PATH, data)
+    if not _PRIME_DB_OK:
+        return
+    try:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                for code, profile in data.items():
+                    cur.execute("""
+                        INSERT INTO affiliate_profiles (code, data, updated_at)
+                        VALUES (%s, %s, NOW())
+                        ON CONFLICT (code) DO UPDATE
+                            SET data = EXCLUDED.data,
+                                updated_at = NOW();
+                    """, (code, psycopg2.extras.Json(profile)))
+            conn.commit()
+        print(f"[affiliate] saved {len(data)} profile(s) to Postgres")
+    except Exception as e:
+        print(f"[affiliate] DB save error (JSON backup written): {e}")
 
 def _compute_balance(profile: dict) -> float:
     """Compute current balance from log entries."""
