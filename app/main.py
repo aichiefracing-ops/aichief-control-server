@@ -40,7 +40,7 @@ try:
         except Exception as e:
             print(f"[prime] DB init error: {e}")
 
-def _init_affiliate_table():
+    def _init_affiliate_table():
         if not _PG_URL:
             return
         try:
