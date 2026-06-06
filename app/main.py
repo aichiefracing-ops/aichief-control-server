@@ -54,6 +54,7 @@ SETTINGS_PATH = DATA_DIR / "settings.json"
 INSTALLS_PATH = DATA_DIR / "installs.json"
 AFFILIATES_PATH = DATA_DIR / "affiliates.json"
 PRIME_PATH = DATA_DIR / "prime_sessions.jsonl"
+AFFILIATE_PROFILES_PATH = DATA_DIR / "affiliate_profiles.json"
 
 CONTROL_API_KEY = (os.getenv("CONTROL_API_KEY") or "").strip()
 
@@ -247,7 +248,38 @@ def _record_affiliate(email: str, code: Optional[str], tier: str) -> None:
         print(f"[affiliate] recorded code={code} email={email} tier={tier}")
     except Exception as e:
         print(f"[affiliate] record failed: {e}")
+# -------------------------
+# Affiliate Profile helpers
+# -------------------------
 
+TIER_MONTHLY_RATE = {
+    "pro_monthly": 2.00,
+    "pro_plus_monthly": 4.00,
+}
+TIER_YEARLY_RATE = {
+    "pro_yearly": 20.00,
+    "pro_plus_yearly": 40.00,
+}
+
+def _load_profiles() -> dict:
+    return _load_json(AFFILIATE_PROFILES_PATH, {})
+
+def _save_profiles(data: dict) -> None:
+    _save_json(AFFILIATE_PROFILES_PATH, data)
+
+def _compute_balance(profile: dict) -> float:
+    """Compute current balance from log entries."""
+    total = 0.0
+    for entry in profile.get("log", []):
+        etype = entry.get("type", "")
+        if etype in ("new_sub_yearly", "recurring", "payout"):
+            total += entry.get("amount", 0.0)
+    return round(total, 2)
+
+def _append_log(profile: dict, entry: dict) -> None:
+    if "log" not in profile:
+        profile["log"] = []
+    profile["log"].append(entry)
 
 # -------------------------
 # Models
@@ -290,7 +322,31 @@ class UnkillIn(BaseModel):
 
 class LicenseCheckIn(BaseModel):
     email: str
+    
+class AffiliateProfileIn(BaseModel):
+    code: str
+    name: str
+    email: str
+    w9: bool = False
+    notes: str = ""
 
+class AffiliateSubIn(BaseModel):
+    code: str
+    sub_name: str
+    tier: str          # pro_monthly | pro_yearly | pro_plus_monthly | pro_plus_yearly
+    start_date: str    # YYYY-MM-DD
+    status: str = "active"  # active | cancelled
+    cancelled_date: Optional[str] = None
+    sub_id: Optional[str] = None  # for updates
+
+class AffiliatePayoutIn(BaseModel):
+    code: str
+    amount: float
+    date: str          # YYYY-MM-DD
+    note: str = ""
+
+class AffiliateGenerateRecurringIn(BaseModel):
+    month: str         # YYYY-MM  e.g. "2026-06"
 
 # -------------------------
 # Boot defaults
@@ -665,8 +721,251 @@ class PrimeSessionIn(BaseModel):
     finish: Dict[str, Any]
     events: List[Dict[str, Any]]
 
+# ═══════════════════════════════════════════════════════════════
+# Affiliate Profile Endpoints
+# ═══════════════════════════════════════════════════════════════
 
+@app.get("/admin/affiliate/profiles")
+def admin_affiliate_profiles_get(
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """Return all affiliate profiles with computed balances."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    profiles = _load_profiles()
+    result = []
+    for code, p in profiles.items():
+        result.append({
+            **p,
+            "balance": _compute_balance(p),
+        })
+    return {"ok": True, "profiles": result}
+
+
+@app.post("/admin/affiliate/profiles")
+def admin_affiliate_profiles_upsert(
+    body: AffiliateProfileIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """Add or update an affiliate profile. Code is the key."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    code = body.code.strip().upper()
+    if not code:
+        raise HTTPException(status_code=400, detail="code required")
+    profiles = _load_profiles()
+    existing = profiles.get(code, {})
+    existing.update({
+        "code": code,
+        "name": body.name.strip(),
+        "email": body.email.strip().lower(),
+        "w9": body.w9,
+        "notes": body.notes.strip(),
+        "subs": existing.get("subs", []),
+        "log": existing.get("log", []),
+    })
+    profiles[code] = existing
+    _save_profiles(profiles)
+    return {"ok": True, "code": code}
+
+
+@app.post("/admin/affiliate/subs")
+def admin_affiliate_sub_add(
+    body: AffiliateSubIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """Add a new subscriber to an affiliate or update status of existing."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    code = body.code.strip().upper()
+    profiles = _load_profiles()
+    if code not in profiles:
+        raise HTTPException(status_code=404, detail=f"Affiliate {code} not found")
+
+    profile = profiles[code]
+    subs = profile.get("subs", [])
+    tier = body.tier.strip().lower()
+    status = body.status.strip().lower()
+
+    if body.sub_id:
+        # Update existing sub status
+        for s in subs:
+            if s.get("sub_id") == body.sub_id:
+                old_status = s.get("status")
+                s["status"] = status
+                if status == "cancelled" and not s.get("cancelled_date"):
+                    s["cancelled_date"] = body.cancelled_date or body.start_date
+                if old_status != status:
+                    _append_log(profile, {
+                        "type": "status_change",
+                        "sub_name": s.get("sub_name", ""),
+                        "tier": tier,
+                        "old_status": old_status,
+                        "new_status": status,
+                        "date": body.cancelled_date or body.start_date,
+                        "amount": 0.0,
+                    })
+                break
+    else:
+        # New sub
+        import uuid as _uuid
+        sub_id = str(_uuid.uuid4())[:8]
+        new_sub = {
+            "sub_id": sub_id,
+            "sub_name": body.sub_name.strip(),
+            "tier": tier,
+            "start_date": body.start_date,
+            "status": status,
+            "cancelled_date": body.cancelled_date,
+        }
+        subs.append(new_sub)
+
+        # Log the new sub + any upfront yearly payout
+        log_entry: Dict[str, Any] = {
+            "type": "new_sub",
+            "sub_name": body.sub_name.strip(),
+            "tier": tier,
+            "date": body.start_date,
+            "amount": 0.0,
+        }
+        if tier in TIER_YEARLY_RATE:
+            upfront = TIER_YEARLY_RATE[tier]
+            log_entry["type"] = "new_sub_yearly"
+            log_entry["amount"] = upfront
+            log_entry["note"] = f"Yearly upfront — ${upfront:.2f}"
+        _append_log(profile, log_entry)
+
+    profile["subs"] = subs
+    profiles[code] = profile
+    _save_profiles(profiles)
+    return {"ok": True, "code": code}
+
+
+@app.post("/admin/affiliate/payouts")
+def admin_affiliate_payout(
+    body: AffiliatePayoutIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """Log a payout — subtracts from balance."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    code = body.code.strip().upper()
+    profiles = _load_profiles()
+    if code not in profiles:
+        raise HTTPException(status_code=404, detail=f"Affiliate {code} not found")
+
+    profile = profiles[code]
+    current_balance = _compute_balance(profile)
+    if body.amount > current_balance:
+        raise HTTPException(status_code=400, detail=f"Payout ${body.amount:.2f} exceeds balance ${current_balance:.2f}")
+
+    _append_log(profile, {
+        "type": "payout",
+        "amount": -abs(body.amount),
+        "date": body.date,
+        "note": body.note.strip(),
+    })
+    profiles[code] = profile
+    _save_profiles(profiles)
+    return {"ok": True, "code": code, "paid": body.amount, "new_balance": round(current_balance - body.amount, 2)}
+
+
+@app.post("/admin/affiliate/generate-recurring")
+def admin_affiliate_generate_recurring(
+    body: AffiliateGenerateRecurringIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """Generate monthly recurring commissions for all affiliates. Month format: YYYY-MM.
+    Safe to call multiple times — will not double-fire for the same month."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    month = body.month.strip()  # e.g. "2026-06"
+    if not month or len(month) != 7:
+        raise HTTPException(status_code=400, detail="month must be YYYY-MM")
+
+    profiles = _load_profiles()
+    results = []
+
+    for code, profile in profiles.items():
+        # Check if already generated for this month
+        already_run = any(
+            e.get("type") == "recurring" and e.get("month") == month
+            for e in profile.get("log", [])
+        )
+        if already_run:
+            results.append({"code": code, "skipped": True, "reason": "already generated"})
+            continue
+
+        total_earned = 0.0
+        breakdown = []
+        for sub in profile.get("subs", []):
+            if sub.get("status") != "active":
+                continue
+            tier = sub.get("tier", "")
+            if tier not in TIER_MONTHLY_RATE:
+                continue
+            # Only count subs that started on or before this month
+            start = sub.get("start_date", "")
+            if start[:7] > month:
+                continue
+            rate = TIER_MONTHLY_RATE[tier]
+            total_earned += rate
+            breakdown.append(f"{sub.get('sub_name', '?')} ({tier}) +${rate:.2f}")
+
+        if total_earned > 0:
+            _append_log(profile, {
+                "type": "recurring",
+                "month": month,
+                "amount": total_earned,
+                "breakdown": breakdown,
+                "date": f"{month}-01",
+            })
+            results.append({"code": code, "earned": total_earned, "breakdown": breakdown})
+        else:
+            results.append({"code": code, "earned": 0.0, "note": "no active monthly subs"})
+
+    _save_profiles(profiles)
+    return {"ok": True, "month": month, "results": results}
+
+
+@app.get("/affiliate/dashboard")
+def affiliate_dashboard(email: str) -> Dict[str, Any]:
+    """Public endpoint — no auth key. Returns affiliate data for the given email.
+    Returns 404 if email is not a registered affiliate."""
+    email = (email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="email required")
+    profiles = _load_profiles()
+    for code, profile in profiles.items():
+        if profile.get("email", "").lower() == email:
+            return {
+                "ok": True,
+                "name": profile.get("name", ""),
+                "code": code,
+                "w9": profile.get("w9", False),
+                "balance": _compute_balance(profile),
+                "subs": profile.get("subs", []),
+                "log": sorted(profile.get("log", []), key=lambda x: x.get("date", ""), reverse=True),
+                "sub_count": sum(1 for s in profile.get("subs", []) if s.get("status") == "active"),
+            }
+    raise HTTPException(status_code=404, detail="Not an affiliate")
 @app.post("/prime/session")
+
 def prime_session(body: PrimeSessionIn) -> Dict[str, Any]:
     """
     Receive a session batch from prime_logger.
