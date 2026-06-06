@@ -828,7 +828,36 @@ def admin_affiliate_sub_add(
             "cancelled_date": body.cancelled_date,
         }
         subs.append(new_sub)
-
+        # Backfill monthly recurring for backdated subs
+        if tier in TIER_MONTHLY_RATE and status == "active":
+            from datetime import date as _date
+            import calendar as _cal
+            rate = TIER_MONTHLY_RATE[tier]
+            try:
+                start_year, start_month, _ = [int(x) for x in body.start_date.split("-")]
+                today = _date.today()
+                y, m = start_year, start_month
+                while (y, m) <= (today.year, today.month):
+                    month_str = f"{y:04d}-{m:02d}"
+                    # Don't double-fire if generate-recurring already ran for this month
+                    already = any(
+                        e.get("type") == "recurring" and e.get("month") == month_str
+                        for e in profile.get("log", [])
+                    )
+                    if not already:
+                        _append_log(profile, {
+                            "type": "recurring",
+                            "month": month_str,
+                            "amount": rate,
+                            "breakdown": [f"{body.sub_name.strip()} ({tier}) +${rate:.2f}"],
+                            "date": f"{month_str}-01",
+                        })
+                    m += 1
+                    if m > 12:
+                        m = 1
+                        y += 1
+            except Exception as e:
+                print(f"[affiliate] backfill failed: {e}")
         # Log the new sub + any upfront yearly payout
         log_entry: Dict[str, Any] = {
             "type": "new_sub",
