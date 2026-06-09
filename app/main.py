@@ -490,6 +490,10 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
     if not email:
         return {"tier": "free", "is_dev": False}
 
+    # Dev accounts always get pro_plus — bypass Stripe entirely
+    if email in DEV_EMAILS:
+        return {"tier": "pro_plus", "email": email, "is_dev": True}
+
     if not STRIPE_SECRET_KEY:
         print("[license] WARN: STRIPE_SECRET_KEY not set — returning free")
         return {"tier": "free", "is_dev": email in DEV_EMAILS}
