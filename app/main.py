@@ -74,6 +74,7 @@ INSTALLS_PATH = DATA_DIR / "installs.json"
 AFFILIATES_PATH = DATA_DIR / "affiliates.json"
 PRIME_PATH = DATA_DIR / "prime_sessions.jsonl"
 AFFILIATE_PROFILES_PATH = DATA_DIR / "affiliate_profiles.json"
+TESTER_OVERRIDES_PATH   = DATA_DIR / "tester_overrides.json"
 
 CONTROL_API_KEY = (os.getenv("CONTROL_API_KEY") or "").strip()
 
@@ -493,7 +494,14 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
     # Dev accounts always get pro_plus — bypass Stripe entirely
     if email in DEV_EMAILS:
         return {"tier": "pro_plus", "email": email, "is_dev": True}
-
+        
+    # ── Tester override (checked before Stripe) ───────────────
+    _overrides = _load_json(TESTER_OVERRIDES_PATH, {})
+    if email in _overrides:
+        _tier = _overrides[email]
+        print(f"[license] {email} → {_tier} (tester override)")
+        return {"tier": _tier, "email": email, "is_dev": False}
+    # ─────────────────────────────────────────────────────────
     if not STRIPE_SECRET_KEY:
         print("[license] WARN: STRIPE_SECRET_KEY not set — returning free")
         return {"tier": "free", "is_dev": email in DEV_EMAILS}
@@ -552,7 +560,60 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
         print(f"[license] Stripe lookup exception: {e}")
         return {"tier": "free", "is_dev": email in DEV_EMAILS}
 
+# -------------------------
+# Tester Override APIs
+# -------------------------
+class TesterOverrideIn(BaseModel):
+    email: str
+    tier: str  # "free" | "pro" | "pro_plus"
 
+@app.get("/admin/testers")
+def admin_testers(
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    return {"ok": True, "overrides": _load_json(TESTER_OVERRIDES_PATH, {})}
+
+@app.post("/admin/tester/add")
+def admin_tester_add(
+    body: TesterOverrideIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    email = body.email.strip().lower()
+    tier = body.tier.strip().lower()
+    if tier not in ("free", "pro", "pro_plus"):
+        raise HTTPException(status_code=400, detail="tier must be free, pro, or pro_plus")
+    overrides = _load_json(TESTER_OVERRIDES_PATH, {})
+    overrides[email] = tier
+    _save_json(TESTER_OVERRIDES_PATH, overrides)
+    print(f"[tester] override set: {email} → {tier}")
+    return {"ok": True, "email": email, "tier": tier}
+
+@app.post("/admin/tester/remove")
+def admin_tester_remove(
+    body: TesterOverrideIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    email = body.email.strip().lower()
+    overrides = _load_json(TESTER_OVERRIDES_PATH, {})
+    overrides.pop(email, None)
+    _save_json(TESTER_OVERRIDES_PATH, overrides)
+    print(f"[tester] override removed: {email}")
+    return {"ok": True, "removed": email}
 # -------------------------
 # Install APIs
 # -------------------------
