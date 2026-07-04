@@ -489,6 +489,7 @@ def client_config(body: ClientConfigIn) -> Dict[str, Any]:
 def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
     email = (body.email or "").strip().lower()
     if not email:
+        print(f"[lictrace] email=<EMPTY> raw={body.email!r} -> tier=free (no email)")
         return {"tier": "free", "is_dev": False}
 
     # Dev accounts always get pro_plus — bypass Stripe entirely
@@ -515,10 +516,12 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
         )
         if not r.ok:
             print(f"[license] Stripe customer lookup failed: {r.status_code}")
-            return {"tier": "free", "is_dev": email in DEV_EMAILS}
+            return {"tier": "free", "is_dev": email in DEV_EMAILS, "lookup_failed": True}
 
         customers = r.json().get("data", [])
+        print(f"[lictrace] email={email!r} stripe_status={r.status_code} customer_count={len(customers)}")
         if not customers:
+            print(f"[lictrace] email={email!r} -> tier=free (no customer in Stripe)")
             return {"tier": "free", "email": email, "is_dev": email in DEV_EMAILS}
 
         for customer in customers:
@@ -533,7 +536,8 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
                 timeout=8,
             )
             if not subs_r.ok:
-                continue
+                print(f"[license] Stripe subs lookup failed for {cid}: {subs_r.status_code}")
+                return {"tier": "free", "email": email, "is_dev": email in DEV_EMAILS, "lookup_failed": True}
 
             subs = subs_r.json().get("data", [])
             for sub in subs:
@@ -544,21 +548,21 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
                     if price_id in STRIPE_PRO_PLUS_IDS or product_id in STRIPE_PRO_PLUS_IDS:
                         code = _extract_promo_code(sub, customer)
                         _record_affiliate(email, code, "pro_plus")
-                        print(f"[license] {email} → pro_plus code={code}")
+                        print(f"[lictrace] email={email!r} -> tier=pro_plus code={code} price={price_id} prod={product_id}")
                         return {"tier": "pro_plus", "email": email, "affiliate_code": code, "is_dev": email in DEV_EMAILS}
 
                     if price_id in STRIPE_PRO_IDS or product_id in STRIPE_PRO_IDS:
                         code = _extract_promo_code(sub, customer)
                         _record_affiliate(email, code, "pro")
-                        print(f"[license] {email} → pro code={code}")
+                        print(f"[lictrace] email={email!r} -> tier=pro code={code} price={price_id} prod={product_id}")
                         return {"tier": "pro", "email": email, "affiliate_code": code, "is_dev": email in DEV_EMAILS}
 
-        print(f"[license] {email} → free (no matching active sub)")
+        print(f"[lictrace] email={email!r} -> tier=free (customer found, NO matching active sub — check price/prod IDs)")
         return {"tier": "free", "email": email, "is_dev": email in DEV_EMAILS}
 
     except Exception as e:
-        print(f"[license] Stripe lookup exception: {e}")
-        return {"tier": "free", "is_dev": email in DEV_EMAILS}
+        print(f"[lictrace] email={email!r} -> EXCEPTION {type(e).__name__}: {e}")
+        return {"tier": "free", "is_dev": email in DEV_EMAILS, "lookup_failed": True}
 
 # -------------------------
 # Tester Override APIs
