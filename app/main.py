@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from fastapi import Response
+from fastapi.responses import RedirectResponse, FileResponse
 import requests
 #test
 # ── Postgres (Prime session storage) ──────────────────────────
@@ -92,6 +93,34 @@ STRIPE_PRO_PLUS_IDS = [
 ]
 # Dev accounts — is_dev=true returned only for these emails
 DEV_EMAILS = {"ksherman618@gmail.com"}
+# ──────────────────────────────────────────────────────────────
+
+# ── Spotter DLC — Daisy (one-time purchase) ────────────────────
+STRIPE_DAISY_PRICE_ID = (os.getenv("STRIPE_DAISY_PRICE_ID") or "").strip()
+
+STRIPE_DAISY_PRODUCT_IDS = [
+    p.strip() for p in (os.getenv("STRIPE_DAISY_PRODUCT_IDS") or "").split(",") if p.strip()
+]
+
+STRIPE_DAISY_PAYMENT_LINK = (os.getenv("STRIPE_DAISY_PAYMENT_LINK") or "").strip()
+
+DAISY_CHECKOUT_SUCCESS_URL = (
+    os.getenv("DAISY_CHECKOUT_SUCCESS_URL")
+    or "https://aichiefracing.com/daisy-thanks"
+).strip()
+DAISY_CHECKOUT_CANCEL_URL = (
+    os.getenv("DAISY_CHECKOUT_CANCEL_URL")
+    or "https://aichiefracing.com/spotters"
+).strip()
+
+# Where the Daisy WAV pack (.zip) lives. Set ONE:
+#   DAISY_DLC_ZIP_URL  — a URL we 302-redirect the client to (your R2 URL)
+#   DAISY_DLC_ZIP_PATH — a local file on the control server we stream.
+DAISY_DLC_ZIP_URL = (os.getenv("DAISY_DLC_ZIP_URL") or "").strip()
+DAISY_DLC_ZIP_PATH = (os.getenv("DAISY_DLC_ZIP_PATH") or "").strip()
+
+# Manual entitlement overrides (comp testers / refunds). email -> {"spotter_daisy": true}
+DLC_OVERRIDES_PATH = DATA_DIR / "dlc_overrides.json"
 # ──────────────────────────────────────────────────────────────
 
 app = FastAPI(title="AI Chief Control Server", version=APP_VERSION)
@@ -615,9 +644,226 @@ def admin_tester_remove(
     email = body.email.strip().lower()
     overrides = _load_json(TESTER_OVERRIDES_PATH, {})
     overrides.pop(email, None)
-    _save_json(TESTER_OVERRIDES_PATH, overrides)
+_save_json(TESTER_OVERRIDES_PATH, overrides)
     print(f"[tester] override removed: {email}")
     return {"ok": True, "removed": email}
+
+# ═══════════════════════════════════════════════════════════════
+# Spotter DLC — Daisy (one-time purchase)
+# ═══════════════════════════════════════════════════════════════
+class DaisyCheckoutIn(BaseModel):
+    email: str
+
+class DlcGrantIn(BaseModel):
+    email: str
+    dlc: str = "spotter_daisy"
+
+
+def _dlc_overrides() -> Dict[str, Any]:
+    return _load_json(DLC_OVERRIDES_PATH, {})
+
+
+def _email_has_dlc_override(email: str, dlc: str) -> bool:
+    try:
+        data = _dlc_overrides().get(email, {})
+        return bool(data.get(dlc, False))
+    except Exception:
+        return False
+
+
+def _stripe_email_owns_daisy(email: str) -> bool:
+    """
+    True if this email has a SUCCEEDED one-time payment for the Daisy pack.
+      1) PaymentIntent Search on metadata stamped at checkout.
+      2) Fallback: paid Checkout Sessions per customer, matched on price/product.
+    """
+    if not STRIPE_SECRET_KEY:
+        return False
+    try:
+        q = (
+            f"metadata['dlc']:'spotter_daisy' AND "
+            f"metadata['email']:'{email}' AND status:'succeeded'"
+        )
+        r = requests.get(
+            "https://api.stripe.com/v1/payment_intents/search",
+            params={"query": q, "limit": 1},
+            auth=(STRIPE_SECRET_KEY, ""),
+            timeout=8,
+        )
+        if r.ok and (r.json().get("data") or []):
+            print(f"[dlc] {email} owns Daisy (payment_intent search hit)")
+            return True
+    except Exception as e:
+        print(f"[dlc] PI search error: {e}")
+
+    if not (STRIPE_DAISY_PRICE_ID or STRIPE_DAISY_PRODUCT_IDS):
+        return False
+    try:
+        cust_r = requests.get(
+            "https://api.stripe.com/v1/customers",
+            params={"email": email, "limit": 5},
+            auth=(STRIPE_SECRET_KEY, ""),
+            timeout=8,
+        )
+        if not cust_r.ok:
+            return False
+        for customer in cust_r.json().get("data", []):
+            cid = customer.get("id")
+            if not cid:
+                continue
+            sess_r = requests.get(
+                "https://api.stripe.com/v1/checkout/sessions",
+                params={"customer": cid, "limit": 25, "expand[]": "data.line_items"},
+                auth=(STRIPE_SECRET_KEY, ""),
+                timeout=8,
+            )
+            if not sess_r.ok:
+                continue
+            for sess in sess_r.json().get("data", []):
+                if sess.get("payment_status") != "paid":
+                    continue
+                for li in (sess.get("line_items", {}) or {}).get("data", []):
+                    price = li.get("price", {}) or {}
+                    if STRIPE_DAISY_PRICE_ID and price.get("id") == STRIPE_DAISY_PRICE_ID:
+                        return True
+                    if price.get("product") in STRIPE_DAISY_PRODUCT_IDS:
+                        return True
+    except Exception as e:
+        print(f"[dlc] session scan error: {e}")
+    return False
+
+
+def _email_owns_daisy(email: str) -> bool:
+    email = (email or "").strip().lower()
+    if not email:
+        return False
+    if email in DEV_EMAILS:
+        return True
+    if _email_has_dlc_override(email, "spotter_daisy"):
+        return True
+    return _stripe_email_owns_daisy(email)
+
+
+@app.post("/license/dlc")
+def license_dlc(body: LicenseCheckIn) -> Dict[str, Any]:
+    """Return which DLC packs an email owns. Public (email-gated) like /license/check."""
+    email = (body.email or "").strip().lower()
+    owns_daisy = _email_owns_daisy(email)
+    print(f"[dlc] {email!r} -> spotter_daisy={owns_daisy}")
+    return {"ok": True, "email": email, "dlc": {"spotter_daisy": owns_daisy}}
+
+
+@app.post("/checkout/spotter-daisy")
+def checkout_spotter_daisy(body: DaisyCheckoutIn) -> Dict[str, Any]:
+    """Create a one-time Stripe Checkout Session for the Daisy pack; return its URL."""
+    email = (body.email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="email required")
+
+    if _email_owns_daisy(email):
+        return {"ok": True, "already_owned": True, "url": ""}
+
+    if STRIPE_SECRET_KEY and STRIPE_DAISY_PRICE_ID:
+        try:
+            form = [
+                ("mode", "payment"),
+                ("customer_email", email),
+                ("line_items[0][price]", STRIPE_DAISY_PRICE_ID),
+                ("line_items[0][quantity]", "1"),
+                ("success_url", DAISY_CHECKOUT_SUCCESS_URL),
+                ("cancel_url", DAISY_CHECKOUT_CANCEL_URL),
+                ("metadata[dlc]", "spotter_daisy"),
+                ("metadata[email]", email),
+                ("payment_intent_data[metadata][dlc]", "spotter_daisy"),
+                ("payment_intent_data[metadata][email]", email),
+            ]
+            r = requests.post(
+                "https://api.stripe.com/v1/checkout/sessions",
+                data=form,
+                auth=(STRIPE_SECRET_KEY, ""),
+                timeout=12,
+            )
+            if r.ok:
+                url = r.json().get("url") or ""
+                if url:
+                    return {"ok": True, "url": url}
+            print(f"[dlc] checkout session create failed: {r.status_code} {r.text[:300]}")
+        except Exception as e:
+            print(f"[dlc] checkout session exception: {e}")
+
+    if STRIPE_DAISY_PAYMENT_LINK:
+        sep = "&" if "?" in STRIPE_DAISY_PAYMENT_LINK else "?"
+        return {"ok": True, "url": f"{STRIPE_DAISY_PAYMENT_LINK}{sep}prefilled_email={email}"}
+
+    raise HTTPException(status_code=500, detail="Daisy checkout not configured (set STRIPE_DAISY_PRICE_ID or STRIPE_DAISY_PAYMENT_LINK)")
+
+
+@app.get("/dlc/spotter-daisy")
+def dlc_download_daisy(email: str):
+    """Serve the Daisy WAV pack (.zip) ONLY to an email that owns it."""
+    email = (email or "").strip().lower()
+    if not _email_owns_daisy(email):
+        raise HTTPException(status_code=403, detail="Daisy not owned by this email")
+    if DAISY_DLC_ZIP_URL:
+        return RedirectResponse(url=DAISY_DLC_ZIP_URL, status_code=302)
+    if DAISY_DLC_ZIP_PATH and Path(DAISY_DLC_ZIP_PATH).exists():
+        return FileResponse(DAISY_DLC_ZIP_PATH, media_type="application/zip", filename="daisy_voice.zip")
+    raise HTTPException(status_code=404, detail="Daisy pack not hosted (set DAISY_DLC_ZIP_URL or DAISY_DLC_ZIP_PATH)")
+
+
+@app.get("/admin/dlc")
+def admin_dlc_list(
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    return {"ok": True, "overrides": _dlc_overrides()}
+
+
+@app.post("/admin/dlc/grant")
+def admin_dlc_grant(
+    body: DlcGrantIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """Comp a DLC to an email (testers/refund fixes) without a Stripe purchase."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    email = body.email.strip().lower()
+    dlc = body.dlc.strip().lower()
+    data = _dlc_overrides()
+    data.setdefault(email, {})[dlc] = True
+    _save_json(DLC_OVERRIDES_PATH, data)
+    print(f"[dlc] granted {dlc} to {email}")
+    return {"ok": True, "email": email, "dlc": dlc}
+
+
+@app.post("/admin/dlc/revoke")
+def admin_dlc_revoke(
+    body: DlcGrantIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    email = body.email.strip().lower()
+    dlc = body.dlc.strip().lower()
+    data = _dlc_overrides()
+    if email in data:
+        data[email].pop(dlc, None)
+        if not data[email]:
+            data.pop(email, None)
+    _save_json(DLC_OVERRIDES_PATH, data)
+    print(f"[dlc] revoked {dlc} from {email}")
+    return {"ok": True, "email": email, "dlc": dlc, "revoked": True}
+
 # -------------------------
 # Install APIs
 # -------------------------
