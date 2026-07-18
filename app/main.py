@@ -687,8 +687,8 @@ def _stripe_email_owns_daisy(email: str) -> bool:
     # 1) PaymentIntent Search API (stamped metadata) --------------------
     try:
         q = (
-            f"metadata['dlc']:'spotter_daisy' AND "
-            f"metadata['email']:'{email}' AND status:'succeeded'"
+            f'metadata["dlc"]:"spotter_daisy" AND '
+            f'metadata["email"]:"{email}" AND status:"succeeded"'
         )
         r = requests.get(
             "https://api.stripe.com/v1/payment_intents/search",
@@ -776,6 +776,7 @@ def checkout_spotter_daisy(body: DaisyCheckoutIn) -> Dict[str, Any]:
         try:
             form = [
                 ("mode", "payment"),
+                ("customer_creation", "always"),
                 ("customer_email", email),
                 ("line_items[0][price]", STRIPE_DAISY_PRICE_ID),
                 ("line_items[0][quantity]", "1"),
