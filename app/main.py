@@ -644,7 +644,7 @@ def admin_tester_remove(
     email = body.email.strip().lower()
     overrides = _load_json(TESTER_OVERRIDES_PATH, {})
     overrides.pop(email, None)
-_save_json(TESTER_OVERRIDES_PATH, overrides)
+    _save_json(TESTER_OVERRIDES_PATH, overrides)
     print(f"[tester] override removed: {email}")
     return {"ok": True, "removed": email}
 
@@ -674,11 +674,17 @@ def _email_has_dlc_override(email: str, dlc: str) -> bool:
 def _stripe_email_owns_daisy(email: str) -> bool:
     """
     True if this email has a SUCCEEDED one-time payment for the Daisy pack.
-      1) PaymentIntent Search on metadata stamped at checkout.
-      2) Fallback: paid Checkout Sessions per customer, matched on price/product.
+
+    Strategy (best-effort, fail-open to False):
+      1) PaymentIntent Search on metadata we stamp at checkout:
+             metadata['dlc']='spotter_daisy' AND status='succeeded'
+      2) Fallback: find customers by email, list their paid Checkout Sessions
+         and match the Daisy price/product on the line items.
     """
     if not STRIPE_SECRET_KEY:
         return False
+
+    # 1) PaymentIntent Search API (stamped metadata) --------------------
     try:
         q = (
             f"metadata['dlc']:'spotter_daisy' AND "
@@ -696,6 +702,7 @@ def _stripe_email_owns_daisy(email: str) -> bool:
     except Exception as e:
         print(f"[dlc] PI search error: {e}")
 
+    # 2) Fallback: paid checkout sessions per customer ------------------
     if not (STRIPE_DAISY_PRICE_ID or STRIPE_DAISY_PRODUCT_IDS):
         return False
     try:
@@ -760,9 +767,11 @@ def checkout_spotter_daisy(body: DaisyCheckoutIn) -> Dict[str, Any]:
     if not email:
         raise HTTPException(status_code=400, detail="email required")
 
+    # Already owns it? Tell the client so it can just unlock.
     if _email_owns_daisy(email):
         return {"ok": True, "already_owned": True, "url": ""}
 
+    # Preferred: dynamic Checkout Session (ties purchase to email + stamps metadata)
     if STRIPE_SECRET_KEY and STRIPE_DAISY_PRICE_ID:
         try:
             form = [
@@ -791,6 +800,7 @@ def checkout_spotter_daisy(body: DaisyCheckoutIn) -> Dict[str, Any]:
         except Exception as e:
             print(f"[dlc] checkout session exception: {e}")
 
+    # Fallback: pre-made Payment Link with email prefilled
     if STRIPE_DAISY_PAYMENT_LINK:
         sep = "&" if "?" in STRIPE_DAISY_PAYMENT_LINK else "?"
         return {"ok": True, "url": f"{STRIPE_DAISY_PAYMENT_LINK}{sep}prefilled_email={email}"}
@@ -804,10 +814,17 @@ def dlc_download_daisy(email: str):
     email = (email or "").strip().lower()
     if not _email_owns_daisy(email):
         raise HTTPException(status_code=403, detail="Daisy not owned by this email")
+
     if DAISY_DLC_ZIP_URL:
         return RedirectResponse(url=DAISY_DLC_ZIP_URL, status_code=302)
+
     if DAISY_DLC_ZIP_PATH and Path(DAISY_DLC_ZIP_PATH).exists():
-        return FileResponse(DAISY_DLC_ZIP_PATH, media_type="application/zip", filename="daisy_voice.zip")
+        return FileResponse(
+            DAISY_DLC_ZIP_PATH,
+            media_type="application/zip",
+            filename="daisy_voice.zip",
+        )
+
     raise HTTPException(status_code=404, detail="Daisy pack not hosted (set DAISY_DLC_ZIP_URL or DAISY_DLC_ZIP_PATH)")
 
 
