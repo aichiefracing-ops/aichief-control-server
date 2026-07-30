@@ -592,7 +592,7 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
                         code = _extract_promo_code(sub, customer)
                         _record_affiliate(email, code, "pro_plus")
                         print(f"[lictrace] email={email!r} -> tier=pro_plus code={code} price={price_id} prod={product_id}")
-                        return _with_tts({"tier": "pro_plus", "email": email, "affiliate_code": code, "is_dev": email in DEV_EMAILS}
+                        return _with_tts({"tier": "pro_plus", "email": email, "affiliate_code": code, "is_dev": email in DEV_EMAILS})
 
                     if price_id in STRIPE_PRO_IDS or product_id in STRIPE_PRO_IDS:
                         code = _extract_promo_code(sub, customer)
