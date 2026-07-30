@@ -94,7 +94,21 @@ STRIPE_PRO_PLUS_IDS = [
 # Dev accounts — is_dev=true returned only for these emails
 DEV_EMAILS = {"ksherman618@gmail.com"}
 # ──────────────────────────────────────────────────────────────
+# ── GPU voice server handout (Pro+ only) ───────────────────────
+# Dynamic-voice GPU server handed to Pro+ clients inside the license response.
+# Set as Railway env vars. Rotate TTS_SERVER_KEY by changing it here AND on the GPU.
+TTS_PRIMARY_URL = (os.getenv("TTS_PRIMARY_URL") or "").strip()
+TTS_BACKUP_URL  = (os.getenv("TTS_BACKUP_URL") or "").strip()
+TTS_SERVER_KEY  = (os.getenv("TTS_SERVER_KEY") or "").strip()
 
+def _with_tts(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach the GPU voice-server handout to Pro+ responses only."""
+    if result.get("tier") == "pro_plus" and TTS_PRIMARY_URL:
+        result = {**result,
+                  "tts_url": TTS_PRIMARY_URL,
+                  "tts_backup_url": TTS_BACKUP_URL,
+                  "tts_key": TTS_SERVER_KEY}
+    return result
 # ── Spotter DLC — Daisy (one-time purchase) ────────────────────
 STRIPE_DAISY_PRICE_ID = (os.getenv("STRIPE_DAISY_PRICE_ID") or "").strip()
 
@@ -523,14 +537,14 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
 
     # Dev accounts always get pro_plus — bypass Stripe entirely
     if email in DEV_EMAILS:
-        return {"tier": "pro_plus", "email": email, "is_dev": True}
+        return _with_tts({"tier": "pro_plus", "email": email, "is_dev": True})
         
     # ── Tester override (checked before Stripe) ───────────────
     _overrides = _load_json(TESTER_OVERRIDES_PATH, {})
     if email in _overrides:
         _tier = _overrides[email]
         print(f"[license] {email} → {_tier} (tester override)")
-        return {"tier": _tier, "email": email, "is_dev": False}
+        return _with_tts({"tier": _tier, "email": email, "is_dev": False})
     # ─────────────────────────────────────────────────────────
     if not STRIPE_SECRET_KEY:
         print("[license] WARN: STRIPE_SECRET_KEY not set — returning free")
@@ -578,7 +592,7 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
                         code = _extract_promo_code(sub, customer)
                         _record_affiliate(email, code, "pro_plus")
                         print(f"[lictrace] email={email!r} -> tier=pro_plus code={code} price={price_id} prod={product_id}")
-                        return {"tier": "pro_plus", "email": email, "affiliate_code": code, "is_dev": email in DEV_EMAILS}
+                        return _with_tts({"tier": "pro_plus", "email": email, "affiliate_code": code, "is_dev": email in DEV_EMAILS}
 
                     if price_id in STRIPE_PRO_IDS or product_id in STRIPE_PRO_IDS:
                         code = _extract_promo_code(sub, customer)
