@@ -94,21 +94,30 @@ STRIPE_PRO_PLUS_IDS = [
 # Dev accounts — is_dev=true returned only for these emails
 DEV_EMAILS = {"ksherman618@gmail.com"}
 # ──────────────────────────────────────────────────────────────
-# ── GPU voice server handout (Pro+ only) ───────────────────────
-# Dynamic-voice GPU server handed to Pro+ clients inside the license response.
-# Set as Railway env vars. Rotate TTS_SERVER_KEY by changing it here AND on the GPU.
+
+# ── Self-hosted GPU voice server (Pro+ only) ───────────────────
+# Pro+ clients synth dynamic Chief lines DIRECTLY against this GPU box.
+# Railway is NOT in the audio path — it only hands the URL + key down
+# inside the license check so the client knows where to call and how
+# to authenticate. Everything here is injected as Railway env vars.
 TTS_PRIMARY_URL = (os.getenv("TTS_PRIMARY_URL") or "").strip()
 TTS_BACKUP_URL  = (os.getenv("TTS_BACKUP_URL") or "").strip()
 TTS_SERVER_KEY  = (os.getenv("TTS_SERVER_KEY") or "").strip()
 
-def _with_tts(result: Dict[str, Any]) -> Dict[str, Any]:
-    """Attach the GPU voice-server handout to Pro+ responses only."""
-    if result.get("tier") == "pro_plus" and TTS_PRIMARY_URL:
-        result = {**result,
-                  "tts_url": TTS_PRIMARY_URL,
-                  "tts_backup_url": TTS_BACKUP_URL,
-                  "tts_key": TTS_SERVER_KEY}
-    return result
+
+def _with_tts(resp: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach the GPU voice-server endpoint + key to Pro+ license responses.
+    No-op for every other tier, and a no-op if no server URL is configured."""
+    try:
+        if resp.get("tier") == "pro_plus" and TTS_PRIMARY_URL:
+            resp["tts_url"] = TTS_PRIMARY_URL
+            resp["tts_backup_url"] = TTS_BACKUP_URL
+            resp["tts_key"] = TTS_SERVER_KEY
+    except Exception:
+        pass
+    return resp
+# ──────────────────────────────────────────────────────────────
+
 # ── Spotter DLC — Daisy (one-time purchase) ────────────────────
 STRIPE_DAISY_PRICE_ID = (os.getenv("STRIPE_DAISY_PRICE_ID") or "").strip()
 
