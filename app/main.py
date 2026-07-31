@@ -95,8 +95,8 @@ STRIPE_PRO_PLUS_IDS = [
 DEV_EMAILS = {"ksherman618@gmail.com"}
 # ──────────────────────────────────────────────────────────────
 
-# ── Self-hosted GPU voice server (Pro+ only) ───────────────────
-# Pro+ clients synth dynamic Chief lines DIRECTLY against this GPU box.
+# ── Self-hosted GPU voice server (paid tiers) ──────────────────
+# Paid clients synth dynamic Chief lines DIRECTLY against this GPU box.
 # Railway is NOT in the audio path — it only hands the URL + key down
 # inside the license check so the client knows where to call and how
 # to authenticate. Everything here is injected as Railway env vars.
@@ -106,10 +106,10 @@ TTS_SERVER_KEY  = (os.getenv("TTS_SERVER_KEY") or "").strip()
 
 
 def _with_tts(resp: Dict[str, Any]) -> Dict[str, Any]:
-    """Attach the GPU voice-server endpoint + key to Pro+ license responses.
-    No-op for every other tier, and a no-op if no server URL is configured."""
+    """Attach the GPU voice-server endpoint + key to paid (pro / pro_plus)
+    license responses. No-op for free, and a no-op if no server URL is set."""
     try:
-        if resp.get("tier") == "pro_plus" and TTS_PRIMARY_URL:
+        if resp.get("tier") in ("pro", "pro_plus") and TTS_PRIMARY_URL:
             resp["tts_url"] = TTS_PRIMARY_URL
             resp["tts_backup_url"] = TTS_BACKUP_URL
             resp["tts_key"] = TTS_SERVER_KEY
@@ -607,7 +607,7 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
                         code = _extract_promo_code(sub, customer)
                         _record_affiliate(email, code, "pro")
                         print(f"[lictrace] email={email!r} -> tier=pro code={code} price={price_id} prod={product_id}")
-                        return {"tier": "pro", "email": email, "affiliate_code": code, "is_dev": email in DEV_EMAILS}
+                        return _with_tts({"tier": "pro", "email": email, "affiliate_code": code, "is_dev": email in DEV_EMAILS})
 
         print(f"[lictrace] email={email!r} -> tier=free (customer found, NO matching active sub — check price/prod IDs)")
         return {"tier": "free", "email": email, "is_dev": email in DEV_EMAILS}
