@@ -59,8 +59,33 @@ try:
         except Exception as e:
             print(f"[affiliate] DB init error: {e}")
 
+    def _init_seats_table():
+        if not _PG_URL:
+            return
+        try:
+            with _pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS license_seats (
+                            email       TEXT NOT NULL,
+                            install_id  TEXT NOT NULL,
+                            tier        TEXT,
+                            machine     TEXT,
+                            first_seen  TIMESTAMPTZ DEFAULT NOW(),
+                            last_seen   TIMESTAMPTZ DEFAULT NOW(),
+                            PRIMARY KEY (email, install_id)
+                        );
+                        CREATE INDEX IF NOT EXISTS seats_email_idx   ON license_seats(email);
+                        CREATE INDEX IF NOT EXISTS seats_install_idx ON license_seats(install_id);
+                    """)
+                conn.commit()
+            print("[seat] DB table ready")
+        except Exception as e:
+            print(f"[seat] DB init error: {e}")
+
     _init_prime_table()
     _init_affiliate_table()
+    _init_seats_table()
     _PRIME_DB_OK = bool(_PG_URL)
 except ImportError:
     _PRIME_DB_OK = False
@@ -78,6 +103,14 @@ AFFILIATE_PROFILES_PATH = DATA_DIR / "affiliate_profiles.json"
 TESTER_OVERRIDES_PATH   = DATA_DIR / "tester_overrides.json"
 
 CONTROL_API_KEY = (os.getenv("CONTROL_API_KEY") or "").strip()
+
+# ── Seat binding (per-email device limit) ──────────────────────
+# Paid emails are limited to SEAT_LIMIT distinct machines. A machine
+# unseen for SEAT_STALE_DAYS is auto-reclaimed on the next check.
+SEAT_LIMIT      = int(os.getenv("SEAT_LIMIT", "2"))
+SEAT_STALE_DAYS = int(os.getenv("SEAT_STALE_DAYS", "7"))
+SEATS_PATH      = DATA_DIR / "license_seats.json"
+# ──────────────────────────────────────────────────────────────
 
 # ── Stripe license lookup ──────────────────────────────────────
 # Set STRIPE_SECRET_KEY as a Railway environment variable
@@ -168,6 +201,214 @@ def _save_json(path: Path, obj: Any) -> None:
 
 def _now() -> float:
     return time.time()
+
+
+# -------------------------
+# Seat binding helpers
+# -------------------------
+def _seat_stale_cutoff_ts() -> float:
+    return _now() - (SEAT_STALE_DAYS * 86400)
+
+
+def _seat_claim(email: str, install_id: str, tier: str, machine: Optional[str] = None):
+    """
+    Enforce the per-email device limit with stale reclaim.
+
+    Returns (allowed: bool, seats_used: int).
+
+    Fails OPEN on any error or missing install_id — we never lock a paying
+    customer out of the app because of a DB glitch or an old client that
+    doesn't send an install_id yet.
+    """
+    email = (email or "").strip().lower()
+    install_id = (install_id or "").strip()
+    if not email or not install_id:
+        return True, 0  # old client / missing id -> don't gate
+
+    cutoff = _seat_stale_cutoff_ts()
+
+    if _PRIME_DB_OK:
+        try:
+            with _pg_conn() as conn:
+                with conn.cursor() as cur:
+                    # 1) reclaim stale seats for this email (~7-day rule)
+                    cur.execute(
+                        "DELETE FROM license_seats WHERE email=%s AND last_seen < to_timestamp(%s)",
+                        (email, cutoff),
+                    )
+                    # 2) already a seat for this machine? -> refresh it
+                    cur.execute(
+                        "SELECT 1 FROM license_seats WHERE email=%s AND install_id=%s",
+                        (email, install_id),
+                    )
+                    exists = cur.fetchone() is not None
+                    if exists:
+                        cur.execute(
+                            "UPDATE license_seats SET last_seen=NOW(), tier=%s, "
+                            "machine=COALESCE(%s, machine) WHERE email=%s AND install_id=%s",
+                            (tier, machine, email, install_id),
+                        )
+                        cur.execute("SELECT COUNT(*) FROM license_seats WHERE email=%s", (email,))
+                        used = int(cur.fetchone()[0])
+                        conn.commit()
+                        return True, used
+                    # 3) new machine -> only if under the limit
+                    cur.execute("SELECT COUNT(*) FROM license_seats WHERE email=%s", (email,))
+                    used = int(cur.fetchone()[0])
+                    if used >= SEAT_LIMIT:
+                        conn.commit()
+                        return False, used
+                    cur.execute(
+                        "INSERT INTO license_seats (email, install_id, tier, machine, first_seen, last_seen) "
+                        "VALUES (%s,%s,%s,%s,NOW(),NOW())",
+                        (email, install_id, tier, machine),
+                    )
+                    conn.commit()
+                    return True, used + 1
+        except Exception as e:
+            print(f"[seat] DB error, failing OPEN: {e}")
+            return True, 0
+
+    # ---- JSON fallback ----
+    try:
+        data = _load_json(SEATS_PATH, {})
+        seats = data.get(email, {}) or {}
+        # reclaim stale
+        seats = {iid: s for iid, s in seats.items()
+                 if float(s.get("last_seen", 0)) >= cutoff}
+        if install_id in seats:
+            seats[install_id].update({"last_seen": _now(), "tier": tier})
+            if machine:
+                seats[install_id]["machine"] = machine
+            data[email] = seats
+            _save_json(SEATS_PATH, data)
+            return True, len(seats)
+        if len(seats) >= SEAT_LIMIT:
+            data[email] = seats
+            _save_json(SEATS_PATH, data)
+            return False, len(seats)
+        seats[install_id] = {
+            "tier": tier, "machine": machine,
+            "first_seen": _now(), "last_seen": _now(),
+        }
+        data[email] = seats
+        _save_json(SEATS_PATH, data)
+        return True, len(seats)
+    except Exception as e:
+        print(f"[seat] JSON error, failing OPEN: {e}")
+        return True, 0
+
+
+def _seat_touch(install_id: str) -> None:
+    """Keep an active machine's seat fresh (called from heartbeat/register)."""
+    install_id = (install_id or "").strip()
+    if not install_id:
+        return
+    if _PRIME_DB_OK:
+        try:
+            with _pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE license_seats SET last_seen=NOW() WHERE install_id=%s",
+                        (install_id,),
+                    )
+                conn.commit()
+            return
+        except Exception as e:
+            print(f"[seat] touch DB error: {e}")
+    try:
+        data = _load_json(SEATS_PATH, {})
+        changed = False
+        for _email, seats in data.items():
+            if install_id in seats:
+                seats[install_id]["last_seen"] = _now()
+                changed = True
+        if changed:
+            _save_json(SEATS_PATH, data)
+    except Exception as e:
+        print(f"[seat] touch JSON error: {e}")
+
+
+def _seats_all() -> List[Dict[str, Any]]:
+    """Every seat row (for the admin panel), enriched with machine/user from installs."""
+    installs = _load_json(INSTALLS_PATH, DEFAULT_INSTALLS)
+    rows: List[Dict[str, Any]] = []
+    if _PRIME_DB_OK:
+        try:
+            with _pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT email, install_id, tier, machine, "
+                        "EXTRACT(EPOCH FROM first_seen), EXTRACT(EPOCH FROM last_seen) "
+                        "FROM license_seats ORDER BY email, last_seen DESC"
+                    )
+                    for em, iid, tier, machine, fs, ls in cur.fetchall():
+                        inst = installs.get(iid, {})
+                        rows.append({
+                            "email": em, "install_id": iid, "tier": tier,
+                            "machine": machine or inst.get("machine"),
+                            "user": inst.get("user"),
+                            "first_seen": float(fs) if fs else None,
+                            "last_seen": float(ls) if ls else None,
+                        })
+            return rows
+        except Exception as e:
+            print(f"[seat] list DB error, falling back to JSON: {e}")
+    data = _load_json(SEATS_PATH, {})
+    for em, seats in data.items():
+        for iid, s in (seats or {}).items():
+            inst = installs.get(iid, {})
+            rows.append({
+                "email": em, "install_id": iid, "tier": s.get("tier"),
+                "machine": s.get("machine") or inst.get("machine"),
+                "user": inst.get("user"),
+                "first_seen": s.get("first_seen"),
+                "last_seen": s.get("last_seen"),
+            })
+    rows.sort(key=lambda r: (r.get("email") or "", -(r.get("last_seen") or 0)))
+    return rows
+
+
+def _seat_free(email: str, install_id: Optional[str] = None) -> int:
+    """Admin: free one seat (or all seats for an email if install_id omitted).
+    Returns number of seats removed."""
+    email = (email or "").strip().lower()
+    install_id = (install_id or "").strip()
+    if not email:
+        return 0
+    if _PRIME_DB_OK:
+        try:
+            with _pg_conn() as conn:
+                with conn.cursor() as cur:
+                    if install_id:
+                        cur.execute(
+                            "DELETE FROM license_seats WHERE email=%s AND install_id=%s",
+                            (email, install_id),
+                        )
+                    else:
+                        cur.execute("DELETE FROM license_seats WHERE email=%s", (email,))
+                    removed = cur.rowcount or 0
+                conn.commit()
+            return int(removed)
+        except Exception as e:
+            print(f"[seat] free DB error: {e}")
+    try:
+        data = _load_json(SEATS_PATH, {})
+        seats = data.get(email, {}) or {}
+        if install_id:
+            removed = 1 if seats.pop(install_id, None) is not None else 0
+            if seats:
+                data[email] = seats
+            else:
+                data.pop(email, None)
+        else:
+            removed = len(seats)
+            data.pop(email, None)
+        _save_json(SEATS_PATH, data)
+        return removed
+    except Exception as e:
+        print(f"[seat] free JSON error: {e}")
+        return 0
 
 
 def _require_admin(
@@ -431,7 +672,9 @@ class UnkillIn(BaseModel):
 
 class LicenseCheckIn(BaseModel):
     email: str
-    
+    install_id: Optional[str] = None
+    machine: Optional[str] = None
+
 class AffiliateProfileIn(BaseModel):
     code: str
     name: str
@@ -600,14 +843,26 @@ def license_check(body: LicenseCheckIn) -> Dict[str, Any]:
                     if price_id in STRIPE_PRO_PLUS_IDS or product_id in STRIPE_PRO_PLUS_IDS:
                         code = _extract_promo_code(sub, customer)
                         _record_affiliate(email, code, "pro_plus")
-                        print(f"[lictrace] email={email!r} -> tier=pro_plus code={code} price={price_id} prod={product_id}")
-                        return _with_tts({"tier": "pro_plus", "email": email, "affiliate_code": code, "is_dev": email in DEV_EMAILS})
+                        allowed, used = _seat_claim(email, body.install_id, "pro_plus", body.machine)
+                        if not allowed:
+                            print(f"[seat] {email} BLOCKED pro_plus seats={used}/{SEAT_LIMIT}")
+                            return {"tier": "free", "email": email, "is_dev": email in DEV_EMAILS,
+                                    "seat_limit_reached": True, "seats_used": used, "seats_max": SEAT_LIMIT}
+                        print(f"[lictrace] email={email!r} -> tier=pro_plus code={code} price={price_id} prod={product_id} seats={used}/{SEAT_LIMIT}")
+                        return _with_tts({"tier": "pro_plus", "email": email, "affiliate_code": code,
+                                          "is_dev": email in DEV_EMAILS, "seats_used": used, "seats_max": SEAT_LIMIT})
 
                     if price_id in STRIPE_PRO_IDS or product_id in STRIPE_PRO_IDS:
                         code = _extract_promo_code(sub, customer)
                         _record_affiliate(email, code, "pro")
-                        print(f"[lictrace] email={email!r} -> tier=pro code={code} price={price_id} prod={product_id}")
-                        return _with_tts({"tier": "pro", "email": email, "affiliate_code": code, "is_dev": email in DEV_EMAILS})
+                        allowed, used = _seat_claim(email, body.install_id, "pro", body.machine)
+                        if not allowed:
+                            print(f"[seat] {email} BLOCKED pro seats={used}/{SEAT_LIMIT}")
+                            return {"tier": "free", "email": email, "is_dev": email in DEV_EMAILS,
+                                    "seat_limit_reached": True, "seats_used": used, "seats_max": SEAT_LIMIT}
+                        print(f"[lictrace] email={email!r} -> tier=pro code={code} price={price_id} prod={product_id} seats={used}/{SEAT_LIMIT}")
+                        return _with_tts({"tier": "pro", "email": email, "affiliate_code": code,
+                                          "is_dev": email in DEV_EMAILS, "seats_used": used, "seats_max": SEAT_LIMIT})
 
         print(f"[lictrace] email={email!r} -> tier=free (customer found, NO matching active sub — check price/prod IDs)")
         return {"tier": "free", "email": email, "is_dev": email in DEV_EMAILS}
@@ -920,6 +1175,7 @@ def install_register(body: RegisterIn) -> Dict[str, Any]:
         "last_seen": _now(),
     }
     _save_json(INSTALLS_PATH, installs)
+    _seat_touch(body.install_id)
     return {"ok": True}
 
 
@@ -932,6 +1188,7 @@ def install_heartbeat(body: HeartbeatIn) -> Dict[str, Any]:
     item["last_seen"] = _now()
     installs[body.install_id] = item
     _save_json(INSTALLS_PATH, installs)
+    _seat_touch(body.install_id)
     return {"ok": True}
 
 
@@ -981,6 +1238,55 @@ def admin_installs(
     installs = _load_json(INSTALLS_PATH, DEFAULT_INSTALLS)
     items = sorted(installs.values(), key=lambda x: x.get("last_seen", 0), reverse=True)
     return {"ok": True, "installs": items}
+
+
+class SeatFreeIn(BaseModel):
+    email: str
+    install_id: Optional[str] = None  # omit to free ALL seats for the email
+
+
+@app.get("/admin/seats")
+def admin_seats(
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """List every bound seat (email -> machines), for support/audit."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    seats = _seats_all()
+    # group by email for a friendlier admin view
+    by_email: Dict[str, Any] = {}
+    for s in seats:
+        by_email.setdefault(s["email"], []).append(s)
+    return {
+        "ok": True,
+        "seat_limit": SEAT_LIMIT,
+        "stale_days": SEAT_STALE_DAYS,
+        "count": len(seats),
+        "seats": seats,
+        "by_email": by_email,
+    }
+
+
+@app.post("/admin/seats/free")
+def admin_seats_free(
+    body: SeatFreeIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """Free a seat so a customer stuck at the limit (e.g. dead PC) can activate a new machine."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    email = (body.email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="email required")
+    removed = _seat_free(email, body.install_id)
+    print(f"[seat] admin freed {removed} seat(s) for {email} install_id={body.install_id or 'ALL'}")
+    return {"ok": True, "email": email, "install_id": body.install_id, "freed": removed}
 
 
 @app.post("/admin/kill")
