@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 from fastapi import Response
 from fastapi.responses import RedirectResponse, FileResponse
@@ -83,9 +83,32 @@ try:
         except Exception as e:
             print(f"[seat] DB init error: {e}")
 
+    def _init_prime_recordings_table():
+        if not _PG_URL:
+            return
+        try:
+            with _pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS prime_recordings (
+                            id          SERIAL PRIMARY KEY,
+                            uuid        TEXT NOT NULL,
+                            received_at TIMESTAMPTZ DEFAULT NOW(),
+                            meta        JSONB NOT NULL,
+                            path        TEXT NOT NULL,
+                            bytes       BIGINT NOT NULL
+                        );
+                        CREATE INDEX IF NOT EXISTS prime_rec_uuid_idx ON prime_recordings(uuid);
+                    """)
+                conn.commit()
+            print("[recording] DB table ready")
+        except Exception as e:
+            print(f"[recording] DB init error: {e}")
+
     _init_prime_table()
     _init_affiliate_table()
     _init_seats_table()
+    _init_prime_recordings_table()
     _PRIME_DB_OK = bool(_PG_URL)
 except ImportError:
     _PRIME_DB_OK = False
@@ -99,6 +122,12 @@ SETTINGS_PATH = DATA_DIR / "settings.json"
 INSTALLS_PATH = DATA_DIR / "installs.json"
 AFFILIATES_PATH = DATA_DIR / "affiliates.json"
 PRIME_PATH = DATA_DIR / "prime_sessions.jsonl"
+RECORDINGS_DIR = DATA_DIR / "recordings"
+RECORDINGS_INDEX = DATA_DIR / "prime_recordings.jsonl"
+# Full ns-stream recordings are far bigger than event batches; cap the upload so a
+# runaway/abusive POST can't exhaust the box. Endurance gzip recordings can be tens of
+# MB — 300 MB is a generous ceiling. Override with MAX_RECORDING_BYTES.
+MAX_RECORDING_BYTES = int(os.getenv("MAX_RECORDING_BYTES", str(300 * 1024 * 1024)))
 AFFILIATE_PROFILES_PATH = DATA_DIR / "affiliate_profiles.json"
 TESTER_OVERRIDES_PATH   = DATA_DIR / "tester_overrides.json"
 
@@ -1765,3 +1794,141 @@ def prime_session(body: PrimeSessionIn) -> Dict[str, Any]:
         raise
     except Exception as e:
         return {"ok": False, "detail": str(e)}
+
+
+# -------------------------
+# Prime session RECORDINGS (full ns-stream replay captures)
+# -------------------------
+# The client's session_recorder POSTs a gzip JSON-Lines ns stream here at race end
+# (consent-gated, anonymous UUID). Body = raw gzip bytes; metadata rides in headers
+# (X-Chief-UUID, X-Chief-Meta). The gzip blob is written to disk (recordings are far
+# larger than the /prime/session event batches — never into JSONB); an index row
+# (uuid + meta + path + bytes) goes to Postgres, with a JSONL-index fallback.
+@app.post("/prime/recording")
+async def prime_recording(
+    request: Request,
+    x_chief_uuid: Optional[str] = Header(default=None, alias="x-chief-uuid"),
+    x_chief_meta: Optional[str] = Header(default=None, alias="x-chief-meta"),
+) -> Dict[str, Any]:
+    try:
+        uuid = (x_chief_uuid or "").strip()
+        if not uuid or len(uuid) < 8:
+            raise HTTPException(status_code=400, detail="invalid uuid")
+
+        blob = await request.body()
+        if not blob:
+            raise HTTPException(status_code=400, detail="empty body")
+        if len(blob) > MAX_RECORDING_BYTES:
+            raise HTTPException(status_code=413, detail="recording too large (%d bytes)" % len(blob))
+
+        meta: Dict[str, Any] = {}
+        if x_chief_meta:
+            try:
+                parsed = json.loads(x_chief_meta)
+                meta = parsed if isinstance(parsed, dict) else {"raw": str(parsed)}
+            except Exception:
+                meta = {"meta_parse_error": True}
+
+        ticks = int(meta.get("ticks") or 0)
+        ts = _now()
+        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        # Filename is server-generated from sanitized parts — no user-controlled path.
+        safe_uuid = "".join(ch for ch in uuid[:12] if ch.isalnum()) or "anon"
+        fname = f"{safe_uuid}_{int(ts)}_{ticks}.jsonl.gz"
+        fpath = RECORDINGS_DIR / fname
+        fpath.write_bytes(blob)
+
+        record = {
+            "ts": ts, "uuid": uuid, "path": str(fpath), "file": fname,
+            "bytes": len(blob), "meta": meta,
+        }
+
+        stored = False
+        if _PRIME_DB_OK:
+            try:
+                with _pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO prime_recordings (uuid, meta, path, bytes) "
+                            "VALUES (%s, %s, %s, %s)",
+                            (uuid, psycopg2.extras.Json(meta), str(fpath), len(blob)),
+                        )
+                    conn.commit()
+                stored = True
+                print(f"[recording] stored uuid={uuid[:8]} ticks={ticks} "
+                      f"bytes={len(blob)} file={fname}")
+            except Exception as e:
+                print(f"[recording] DB write error: {e}")
+
+        if not stored:
+            RECORDINGS_INDEX.parent.mkdir(parents=True, exist_ok=True)
+            with RECORDINGS_INDEX.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
+            print(f"[recording] JSONL-index fallback uuid={uuid[:8]} file={fname}")
+
+        return {"ok": True, "bytes": len(blob), "ticks": ticks, "file": fname}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"ok": False, "detail": str(e)}
+
+
+@app.get("/admin/recordings")
+def admin_recordings(
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """List captured recordings (newest first) so you can pick which to pull."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    rows: List[Dict[str, Any]] = []
+    if _PRIME_DB_OK:
+        try:
+            with _pg_conn() as conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(
+                        "SELECT id, uuid, received_at, meta, path, bytes "
+                        "FROM prime_recordings ORDER BY received_at DESC LIMIT 500"
+                    )
+                    for r in cur.fetchall():
+                        d = dict(r)
+                        d["file"] = Path(d.get("path") or "").name
+                        d["received_at"] = str(d.get("received_at"))
+                        rows.append(d)
+        except Exception as e:
+            print(f"[recording] list DB error: {e}")
+    # Surface any files on disk not represented above (e.g. JSONL-fallback ingests).
+    try:
+        if RECORDINGS_DIR.exists():
+            known = {r.get("file") for r in rows}
+            for p in sorted(RECORDINGS_DIR.glob("*.jsonl.gz"), reverse=True):
+                if p.name not in known:
+                    rows.append({"file": p.name, "path": str(p),
+                                 "bytes": p.stat().st_size,
+                                 "uuid": p.name.split("_")[0],
+                                 "meta": None, "on_disk_only": True})
+    except Exception:
+        pass
+    return {"ok": True, "count": len(rows), "recordings": rows}
+
+
+@app.get("/admin/recording/{fname}")
+def admin_recording_download(
+    fname: str,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+):
+    """Download one recording's gzip by filename (from /admin/recordings)."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    # Path-traversal guard: only a bare .gz filename inside RECORDINGS_DIR.
+    safe = Path(fname).name
+    fpath = RECORDINGS_DIR / safe
+    if safe != fname or fpath.suffix != ".gz" or not fpath.exists():
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(str(fpath), media_type="application/gzip", filename=safe)
