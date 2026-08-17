@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 from fastapi import Response
-from fastapi.responses import RedirectResponse, FileResponse
+from fastapi.responses import RedirectResponse, FileResponse, HTMLResponse
 import requests
 #test
 # ── Postgres (Prime session storage) ──────────────────────────
@@ -105,10 +105,40 @@ try:
         except Exception as e:
             print(f"[recording] DB init error: {e}")
 
+    def _init_qa_findings_table():
+        if not _PG_URL:
+            return
+        try:
+            with _pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS prime_qa_findings (
+                            id             SERIAL PRIMARY KEY,
+                            recording_file TEXT,
+                            uuid           TEXT,
+                            build          TEXT,
+                            track          TEXT,
+                            car            TEXT,
+                            worker         TEXT,
+                            ticks          INTEGER DEFAULT 0,
+                            status         TEXT,
+                            summary        TEXT,
+                            report         JSONB,
+                            created_at     TIMESTAMPTZ DEFAULT NOW()
+                        );
+                        CREATE INDEX IF NOT EXISTS qa_findings_created_idx ON prime_qa_findings(created_at DESC);
+                        CREATE INDEX IF NOT EXISTS qa_findings_file_idx ON prime_qa_findings(recording_file);
+                    """)
+                conn.commit()
+            print("[qa] DB table ready")
+        except Exception as e:
+            print(f"[qa] DB init error: {e}")
+
     _init_prime_table()
     _init_affiliate_table()
     _init_seats_table()
     _init_prime_recordings_table()
+    _init_qa_findings_table()
     _PRIME_DB_OK = bool(_PG_URL)
 except ImportError:
     _PRIME_DB_OK = False
@@ -123,6 +153,7 @@ INSTALLS_PATH = DATA_DIR / "installs.json"
 AFFILIATES_PATH = DATA_DIR / "affiliates.json"
 PRIME_PATH = DATA_DIR / "prime_sessions.jsonl"
 RECORDINGS_DIR = DATA_DIR / "recordings"
+QA_FINDINGS_INDEX = DATA_DIR / "qa_findings.jsonl"
 RECORDINGS_INDEX = DATA_DIR / "prime_recordings.jsonl"
 # Full ns-stream recordings are far bigger than event batches; cap the upload so a
 # runaway/abusive POST can't exhaust the box. Endurance gzip recordings can be tens of
@@ -1932,3 +1963,310 @@ def admin_recording_download(
     if safe != fname or fpath.suffix != ".gz" or not fpath.exists():
         raise HTTPException(status_code=404, detail="not found")
     return FileResponse(str(fpath), media_type="application/gzip", filename=safe)
+
+
+# ==================================================================
+# QA — lugnut worker findings (replay-harness results per recording)
+# ==================================================================
+class QaFindingIn(BaseModel):
+    recording_file: str = ""
+    uuid: str = ""
+    build: str = ""
+    track: str = ""
+    car: str = ""
+    worker: str = ""
+    ticks: int = 0
+    status: str = "clean"          # "clean" | "found" | "error"
+    summary: str = ""
+    report: Dict[str, Any] = {}
+    error: Optional[str] = None
+
+
+try:
+    QaFindingIn.model_rebuild()   # ensure the schema is fully built (Pydantic v2)
+except Exception:
+    pass
+
+
+@app.post("/qa/findings")
+def qa_findings_post(
+    body: QaFindingIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """A lugnut worker submits its replay-harness result for one recording."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    record = {
+        "ts": _now(), "recording_file": body.recording_file, "uuid": body.uuid,
+        "build": body.build, "track": body.track, "car": body.car,
+        "worker": body.worker, "ticks": body.ticks, "status": body.status,
+        "summary": body.summary, "report": body.report, "error": body.error,
+    }
+    stored = False
+    if _PRIME_DB_OK:
+        try:
+            with _pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO prime_qa_findings "
+                        "(recording_file, uuid, build, track, car, worker, ticks, status, summary, report) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (body.recording_file, body.uuid, body.build, body.track, body.car,
+                         body.worker, int(body.ticks or 0), body.status, body.summary,
+                         psycopg2.extras.Json(body.report or {})),
+                    )
+                conn.commit()
+            stored = True
+            print(f"[qa] finding {body.status} worker={body.worker} file={body.recording_file}")
+        except Exception as e:
+            print(f"[qa] DB write error: {e}")
+    if not stored:
+        QA_FINDINGS_INDEX.parent.mkdir(parents=True, exist_ok=True)
+        with QA_FINDINGS_INDEX.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        print(f"[qa] JSONL fallback worker={body.worker} file={body.recording_file}")
+    return {"ok": True, "status": body.status}
+
+
+@app.get("/admin/qa/findings.json")
+def qa_findings_feed(
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """Findings feed the dashboard fetches (newest first)."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    rows: List[Dict[str, Any]] = []
+    if _PRIME_DB_OK:
+        try:
+            with _pg_conn() as conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(
+                        "SELECT id, recording_file, uuid, build, track, car, worker, ticks, "
+                        "status, summary, report, created_at "
+                        "FROM prime_qa_findings ORDER BY created_at DESC LIMIT 200"
+                    )
+                    for r in cur.fetchall():
+                        d = dict(r)
+                        d["created_at"] = str(d.get("created_at"))
+                        rows.append(d)
+        except Exception as e:
+            print(f"[qa] feed DB error: {e}")
+    elif QA_FINDINGS_INDEX.exists():
+        try:
+            for line in QA_FINDINGS_INDEX.read_text(encoding="utf-8").splitlines()[-200:]:
+                if line.strip():
+                    rows.append(json.loads(line))
+            rows.reverse()
+        except Exception:
+            pass
+    return {"ok": True, "count": len(rows), "findings": rows}
+
+
+_QA_DASHBOARD_HTML = r'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+<title>AI Chief — Lugnut QA</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --line:#2b3444;
+    --txt:#e6edf3; --dim:#9aa7b4; --accent:#f2a63b;
+    --found:#f2544d; --clean:#3fb950; --err:#e3b341;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-text-size-adjust:100%}
+  header{position:sticky;top:0;z-index:5;background:linear-gradient(180deg,#0d1117 70%,rgba(13,17,23,0));
+    padding:14px 16px 10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  h1{font-size:18px;margin:0;letter-spacing:.3px}
+  h1 .wrench{color:var(--accent)}
+  .sub{color:var(--dim);font-size:12px;margin-left:auto;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  .btn{background:var(--panel2);border:1px solid var(--line);color:var(--txt);
+    border-radius:8px;padding:7px 11px;font-size:13px;cursor:pointer}
+  .btn:active{transform:translateY(1px)}
+  .btn.small{padding:4px 9px;font-size:12px}
+  .wrap{padding:4px 12px 60px;max-width:1000px;margin:0 auto}
+  .empty{color:var(--dim);text-align:center;padding:50px 20px}
+  .card{background:var(--panel);border:1px solid var(--line);border-left-width:4px;
+    border-radius:10px;margin:10px 0;overflow:hidden}
+  .card.found{border-left-color:var(--found)}
+  .card.clean{border-left-color:var(--clean)}
+  .card.error{border-left-color:var(--err)}
+  .row{display:flex;align-items:center;gap:10px;padding:11px 13px;cursor:pointer;flex-wrap:wrap}
+  .badge{font-size:11px;font-weight:700;letter-spacing:.4px;padding:3px 8px;border-radius:999px;white-space:nowrap}
+  .badge.found{background:rgba(242,84,77,.15);color:var(--found)}
+  .badge.clean{background:rgba(63,185,80,.15);color:var(--clean)}
+  .badge.error{background:rgba(227,179,65,.15);color:var(--err)}
+  .worker{font-weight:600}
+  .meta{color:var(--dim);font-size:12.5px}
+  .grow{flex:1 1 auto;min-width:120px}
+  .sum{width:100%;color:var(--txt);font-size:13.5px;margin-top:-2px}
+  .sum.found{color:#ffb3af}
+  .body{display:none;padding:0 13px 13px;border-top:1px solid var(--line)}
+  .card.open .body{display:block}
+  .sec{margin:12px 0 4px;color:var(--accent);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+  .item{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:9px 11px;margin:6px 0;font-size:13px}
+  .item .k{color:var(--found);font-weight:600}
+  .kv{color:var(--dim);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;white-space:pre-wrap;word-break:break-word;margin-top:4px}
+  .actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+  .ok{color:var(--clean)}
+  .toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:var(--accent);color:#111;
+    font-weight:600;padding:9px 16px;border-radius:10px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:20}
+  .toast.show{opacity:1}
+  .filters{display:flex;gap:8px;align-items:center}
+  label.tog{color:var(--dim);font-size:12.5px;display:flex;gap:5px;align-items:center;cursor:pointer}
+  .keybox{padding:40px 16px;max-width:420px;margin:0 auto;text-align:center}
+  .keybox input{width:100%;padding:11px;border-radius:9px;border:1px solid var(--line);background:var(--panel);color:var(--txt);font-size:15px;margin:12px 0}
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="wrench">&#128295;</span> Lugnut QA</h1>
+  <div class="sub">
+    <div class="filters"><label class="tog"><input type="checkbox" id="onlyIssues"/> issues only</label></div>
+    <span id="status">—</span>
+    <button class="btn small" id="refresh">Refresh</button>
+    <button class="btn small" id="copyall">Copy all issues</button>
+  </div>
+</header>
+<div class="wrap" id="wrap">
+  <div id="keybox" class="keybox" style="display:none">
+    <div>Enter the control key to view findings.</div>
+    <input type="password" id="keyin" placeholder="CONTROL_API_KEY" autocomplete="off"/>
+    <button class="btn" id="keygo">View dashboard</button>
+  </div>
+  <div id="list"></div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+const $=s=>document.querySelector(s);
+let KEY=sessionStorage.getItem("qa_key")||"";
+let DATA=[];
+let TIMER=null;
+
+function toast(m){const t=$("#toast");t.textContent=m;t.classList.add("show");setTimeout(()=>t.classList.remove("show"),1400);}
+function esc(x){return (x==null?"":String(x)).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
+function j(o){try{return JSON.stringify(o);}catch(e){return String(o);}}
+
+function claudeBlock(f){
+  const r=f.report||{};
+  const L=[];
+  L.push("AI Chief QA — "+(f.worker||"lugnut")+" — "+String(f.status||"").toUpperCase());
+  L.push("recording: "+(f.recording_file||"?"));
+  L.push("build "+(f.build||"?")+" | "+(f.car||"?")+" @ "+(f.track||"?")+" | "+(f.ticks||0)+" ticks | "+(f.created_at||""));
+  if(f.summary) L.push("summary: "+f.summary);
+  if(f.error) L.push("ERROR: "+f.error);
+  const V=r.violations||[];
+  if(V.length){
+    L.push("");L.push("INVARIANT VIOLATIONS ("+V.length+"):");
+    V.forEach((v,i)=>{
+      L.push("["+(i+1)+"] "+(v.invariant||"?")+" — "+(v.detail||""));
+      L.push("    at tick "+(v.first_bad_i)+", lap "+(v.lap)+", session "+(v.session_state));
+      if(v.ns_fuel) L.push("    ns_fuel: "+j(v.ns_fuel));
+      if(v.state_fuel) L.push("    state_fuel: "+j(v.state_fuel));
+      if(v.inc_says&&v.inc_says.length) L.push("    inc_says: "+j(v.inc_says));
+    });
+  }
+  const M=r.service_mismatch||[];
+  if(M.length){
+    L.push("");L.push("SERVICE-VS-BOX MISMATCH ("+M.length+") — needs triage:");
+    M.forEach(m=>L.push("  tick "+m.at_i+": Chief said '"+m.spoke+"' but box='"+m.box+"'"));
+  }
+  const D=r.service_drift||[];
+  if(D.length){
+    L.push("");L.push("SERVICE DRIFT IN CAUTION ("+D.length+") — informational:");
+    D.forEach(d=>L.push("  caution@"+d.caution_start_i+": "+d.from+" -> "+d.to+" at tick "+d.at_i));
+  }
+  L.push("");
+  L.push("free_tier_silent: "+(r.free_tier_silent===false?"LEAK ("+(r.free_tier_leaks||0)+" ticks)":"ok"));
+  L.push("says: total "+(r.says_total||0)+", by_tag "+j(r.say_tags||{}));
+  return L.join("\n");
+}
+
+function copyText(t){
+  if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(()=>toast("Copied for Claude")).catch(()=>fallback(t));}
+  else fallback(t);
+}
+function fallback(t){const ta=document.createElement("textarea");ta.value=t;document.body.appendChild(ta);ta.select();try{document.execCommand("copy");toast("Copied");}catch(e){toast("Copy failed");}ta.remove();}
+
+function render(){
+  const only=$("#onlyIssues").checked;
+  const list=$("#list");
+  const rows=DATA.filter(f=>!only||f.status==="found"||f.status==="error");
+  if(!rows.length){list.innerHTML='<div class="empty">'+(DATA.length?"No issues — all clean.":"No findings yet. Workers report here as recordings come in.")+'</div>';return;}
+  list.innerHTML=rows.map((f,idx)=>{
+    const st=f.status||"clean";
+    const r=f.report||{};
+    const nV=(r.violations||[]).length, nM=(r.service_mismatch||[]).length, nD=(r.service_drift||[]).length;
+    let details="";
+    if(nV){details+='<div class="sec">Invariant violations ('+nV+')</div>'+(r.violations||[]).map(v=>
+      '<div class="item"><span class="k">'+esc(v.invariant)+'</span> — '+esc(v.detail||"")+
+      '<div class="kv">tick '+esc(v.first_bad_i)+'  lap '+esc(v.lap)+'  session '+esc(v.session_state)+
+      (v.state_fuel?'\nstate_fuel: '+esc(j(v.state_fuel)):'')+
+      (v.ns_fuel?'\nns_fuel: '+esc(j(v.ns_fuel)):'')+'</div></div>').join("");}
+    if(nM){details+='<div class="sec">Service vs box — triage ('+nM+')</div>'+(r.service_mismatch||[]).map(m=>
+      '<div class="item">tick '+esc(m.at_i)+': Chief said <b>'+esc(m.spoke)+'</b> but box=<b>'+esc(m.box)+'</b></div>').join("");}
+    if(nD){details+='<div class="sec">Service drift ('+nD+')</div>'+(r.service_drift||[]).map(d=>
+      '<div class="item">caution@'+esc(d.caution_start_i)+': '+esc(d.from)+' &rarr; '+esc(d.to)+' at tick '+esc(d.at_i)+'</div>').join("");}
+    if(f.error){details+='<div class="sec">Error</div><div class="item">'+esc(f.error)+'</div>';}
+    if(!details){details='<div class="item ok">Clean — no invariant broke. says total '+esc(r.says_total||0)+', free-tier '+(r.free_tier_silent===false?'LEAK':'ok')+'.</div>';}
+    return '<div class="card '+st+'" data-i="'+idx+'">'+
+      '<div class="row" onclick="this.parentNode.classList.toggle(\'open\')">'+
+        '<span class="badge '+st+'">'+esc(st.toUpperCase())+'</span>'+
+        '<span class="worker">'+esc(f.worker||"lugnut")+'</span>'+
+        '<span class="meta grow">'+esc(f.car||"")+' @ '+esc(f.track||"")+' &middot; '+esc(f.ticks||0)+' ticks &middot; '+esc((f.created_at||"").replace("T"," ").slice(0,19))+'</span>'+
+        '<span class="meta">'+esc(f.recording_file||"")+'</span>'+
+        (f.summary?'<div class="sum '+st+'">'+esc(f.summary)+'</div>':'')+
+      '</div>'+
+      '<div class="body">'+details+
+        '<div class="actions"><button class="btn small" onclick="copyOne('+idx+')">&#128203; Copy for Claude</button></div>'+
+      '</div></div>';
+  }).join("");
+}
+
+window.copyOne=function(i){const f=DATA.filter(f=>!$("#onlyIssues").checked||f.status==="found"||f.status==="error")[i];if(f)copyText(claudeBlock(f));};
+
+function copyAll(){
+  const issues=DATA.filter(f=>f.status==="found"||f.status==="error");
+  if(!issues.length){toast("No issues to copy");return;}
+  copyText(issues.map(claudeBlock).join("\n\n"+"=".repeat(56)+"\n\n"));
+}
+
+function load(){
+  if(!KEY){$("#keybox").style.display="block";$("#status").textContent="locked";return;}
+  $("#status").textContent="loading…";
+  fetch("/admin/qa/findings.json",{headers:{"x-aichief-key":KEY}})
+    .then(r=>{if(r.status===401){throw new Error("bad key");}return r.json();})
+    .then(d=>{DATA=d.findings||[];$("#keybox").style.display="none";
+      const iss=DATA.filter(f=>f.status==="found"||f.status==="error").length;
+      $("#status").textContent=DATA.length+" runs · "+iss+" with issues";
+      render();})
+    .catch(e=>{$("#status").textContent=e.message;if(e.message==="bad key"){sessionStorage.removeItem("qa_key");KEY="";$("#keybox").style.display="block";}});
+}
+
+$("#keygo").onclick=()=>{KEY=$("#keyin").value.trim();if(KEY){sessionStorage.setItem("qa_key",KEY);load();}};
+$("#keyin").addEventListener("keydown",e=>{if(e.key==="Enter")$("#keygo").click();});
+$("#refresh").onclick=load;
+$("#copyall").onclick=copyAll;
+$("#onlyIssues").onchange=render;
+load();
+TIMER=setInterval(load,20000);
+</script>
+</body>
+</html>
+'''
+
+
+@app.get("/admin/qa", response_class=HTMLResponse)
+def qa_dashboard() -> Any:
+    """Lugnut QA dashboard — phone + desktop. The page shell loads without auth; it
+    prompts for the control key and uses it to fetch the findings feed."""
+    return HTMLResponse(_QA_DASHBOARD_HTML)
