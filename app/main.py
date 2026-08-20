@@ -2305,6 +2305,20 @@ def qa_dashboard() -> Any:
 
 import random as _rnd
 
+# The Postgres block at the top of this file defines _PG_URL and _pg_conn INSIDE a
+# `try: import psycopg2`. On a host without psycopg2 the except branch sets only
+# _PRIME_DB_OK, so both names are undefined — and anything down here that touches
+# them raises NameError AT IMPORT, i.e. the whole server fails to boot rather than
+# degrading to the JSONL fallback. Railway has psycopg2 so it would not show there;
+# it would show the first time someone ran this locally. Define the fallbacks.
+try:
+    _PG_URL
+except NameError:
+    _PG_URL = ""
+
+    def _pg_conn():   # never reached: every call site is guarded on _PG_URL
+        raise RuntimeError("psycopg2 unavailable")
+
 RETAIN_CLEAN_DAYS       = int(os.getenv("RETAIN_CLEAN_DAYS", "3"))
 COVERAGE_KEEP_PER_COMBO = int(os.getenv("COVERAGE_KEEP_PER_COMBO", "2"))
 STORAGE_BUDGET_GB       = float(os.getenv("STORAGE_BUDGET_GB", "4"))
@@ -2643,3 +2657,448 @@ def admin_recordings_storage(
         return {"ok": False, "detail": str(e)}
     out["pct_of_budget"] = round(100.0 * out.get("raw_gb", 0) / max(0.001, STORAGE_BUDGET_GB), 1)
     return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENDURANCE TEAM RELAY  (merged from src/team_relay.py — see
+# claude/ENDURANCE_RELAY_PROTOCOL.md and ENDURANCE_TEAM_SYNC_DESIGN.md)
+#
+# The relay is deliberately dumb: it carries the roster, the stint plan, live
+# dashboard state and an event ring. It does NOT decide who is driving — every
+# client derives that from the SDK. State is versioned; update_plan is
+# compare-and-swap on `version` and returns 409 with the current state on
+# conflict, which is what team_client's retry expects.
+#
+# The store functions below are lifted verbatim in behaviour from the reference
+# implementation, renamed with a _tr_ prefix so nothing can collide with the
+# control server's own helpers.
+#
+# ── DEPLOYMENT CONSTRAINTS — READ BEFORE SHIPPING ────────────────────────────
+# 1. RUN A SINGLE WORKER. Room state lives in this process's memory. With more
+#    than one uvicorn worker, create/join land in different processes and rooms
+#    go missing at random. If the Railway start command has --workers > 1, this
+#    will not work.
+# 2. ROOMS DO NOT SURVIVE A REDEPLOY. In-memory, 8h TTL. An endurance race that
+#    spans a redeploy loses its room and every client gets unknown_token. Fine
+#    for a first teammate test; before real enduros the store wants persisting
+#    to Postgres (the state dict is small JSON — write on mutation, lazy-load on
+#    cache miss).
+# 3. TEAM_RELAY_ENFORCE=1 makes the tier gate fail CLOSED. Leave it 0 only while
+#    testing the loop.
+# ══════════════════════════════════════════════════════════════════════════════
+
+import secrets as _tr_secrets
+import threading as _tr_threading
+
+_TR_LOCK = _tr_threading.RLock()
+_TR_ROOMS: Dict[str, Any] = {}      # code -> state dict
+_TR_TOKENS: Dict[str, Any] = {}     # member_token -> {"code":.., "custid":..}
+
+_TR_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # no O/0/I/1
+_TR_ROOM_TTL_S = float(os.getenv("TEAM_ROOM_TTL_S", str(8 * 3600)))
+_TR_EVENT_RING = 200
+_TR_HISTORY_MAX = 40
+_TR_MAX_MEMBERS = int(os.getenv("TEAM_MAX_MEMBERS", "8"))
+TEAM_RELAY_ENFORCE = (os.getenv("TEAM_RELAY_ENFORCE", "0").strip() == "1")
+
+# Tier lookups are cached: a create/join must not pay a double Stripe round-trip,
+# and a reconnect storm must not hammer Stripe.
+_TR_TIER_CACHE: Dict[str, Any] = {}
+_TR_TIER_TTL_S = float(os.getenv("TEAM_TIER_CACHE_S", "900"))
+
+
+def _tr_tier_for_email(email: str) -> str:
+    """READ-ONLY tier lookup for the relay gate.
+
+    Deliberately NOT license_check(): that function also calls _seat_claim(), so
+    using it here would burn a license seat every time somebody opened a team
+    room. This resolves tier only and claims nothing. It reuses the same
+    STRIPE_PRO_PLUS_IDS / DEV_EMAILS / tester-override sources, so there is one
+    place to change price IDs.
+    """
+    email = (email or "").strip().lower()
+    if not email:
+        return "free"
+    hit = _TR_TIER_CACHE.get(email)
+    if hit and (_now() - hit[0]) < _TR_TIER_TTL_S:
+        return hit[1]
+
+    tier = "free"
+    try:
+        if email in DEV_EMAILS:
+            tier = "pro_plus"
+        else:
+            _ov = _load_json(TESTER_OVERRIDES_PATH, {})
+            if email in _ov:
+                tier = str(_ov[email] or "free")
+            elif STRIPE_SECRET_KEY:
+                r = requests.get("https://api.stripe.com/v1/customers",
+                                 params={"email": email, "limit": 5},
+                                 auth=(STRIPE_SECRET_KEY, ""), timeout=8)
+                if r.ok:
+                    for customer in r.json().get("data", []):
+                        cid = customer.get("id")
+                        if not cid:
+                            continue
+                        sr = requests.get("https://api.stripe.com/v1/subscriptions",
+                                          params={"customer": cid, "status": "active", "limit": 10},
+                                          auth=(STRIPE_SECRET_KEY, ""), timeout=8)
+                        if not sr.ok:
+                            continue
+                        for sub in sr.json().get("data", []):
+                            for item in sub.get("items", {}).get("data", []):
+                                pid = item.get("price", {}).get("id", "")
+                                prod = item.get("price", {}).get("product", "")
+                                if pid in STRIPE_PRO_PLUS_IDS or prod in STRIPE_PRO_PLUS_IDS:
+                                    tier = "pro_plus"
+                                    break
+                            if tier == "pro_plus":
+                                break
+                        if tier == "pro_plus":
+                            break
+    except Exception as e:
+        print(f"[team] tier lookup error for {email}: {e}")
+        # Do NOT cache a failed lookup — a Stripe blip would lock a paying
+        # customer out of their own enduro for the whole TTL.
+        return "error"
+
+    _TR_TIER_CACHE[email] = (_now(), tier)
+    return tier
+
+
+def _tr_seat_matches(email: str, install_id: Optional[str]) -> bool:
+    """Optional strengthening: if the client sent an install_id, require that it
+    is a seat already claimed by this email.
+
+    Today's team_client sends only {email, license_token, my_id}, so email alone
+    is the credential — i.e. the gate is 'do you know a Pro+ email address',
+    which is not authentication. When the client starts sending install_id this
+    binds a room to a machine that actually activated. Absent install_id we do
+    not fail, so this is forward-compatible with the shipped client."""
+    if not install_id or not _PG_URL:
+        return True
+    try:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM license_seats WHERE email=%s AND install_id=%s",
+                            ((email or "").strip().lower(), install_id))
+                return cur.fetchone() is not None
+    except Exception as e:
+        print(f"[team] seat check error: {e}")
+        return not TEAM_RELAY_ENFORCE      # fail closed only when enforcing
+
+
+def verify_pro_plus(email: str, license_token: str = "", install_id: Optional[str] = None) -> bool:
+    """True iff this account may open/join a team room.
+
+    TEAM_RELAY_ENFORCE=0 (dev) fails OPEN so the loop is testable without Stripe.
+    TEAM_RELAY_ENFORCE=1 (production) fails CLOSED on any error — a lookup blip
+    denies rather than admits."""
+    if not TEAM_RELAY_ENFORCE:
+        return True
+    tier = _tr_tier_for_email(email)
+    if tier != "pro_plus":
+        print(f"[team] DENY {email!r} tier={tier}")
+        return False
+    if not _tr_seat_matches(email, install_id):
+        print(f"[team] DENY {email!r} install_id not a claimed seat")
+        return False
+    return True
+
+
+# --------------------------------------------------------------- store helpers
+def _tr_gen_code() -> str:
+    while True:
+        code = "".join(_tr_secrets.choice(_TR_CODE_ALPHABET) for _ in range(6))
+        if code not in _TR_ROOMS:
+            return code
+
+
+def _tr_reap() -> None:
+    dead = [c for c, r in _TR_ROOMS.items() if (_now() - r.get("_created", 0)) > _TR_ROOM_TTL_S]
+    for c in dead:
+        if _TR_ROOMS.pop(c, None):
+            for t in [t for t, v in _TR_TOKENS.items() if v.get("code") == c]:
+                _TR_TOKENS.pop(t, None)
+    if dead:
+        print(f"[team] reaped {len(dead)} expired room(s)")
+
+
+def _tr_new_state(code: str, host_custid) -> Dict[str, Any]:
+    return {
+        "version": 1, "last_seq": 0, "_created": _now(),
+        "room": {"code": code, "created_at": _now(), "host_custid": host_custid,
+                 "locked": False, "members": []},
+        "plan": {"version": 1, "stints": [], "alert_lead_min": 5},
+        "live": {}, "resources": {}, "events": [], "stint_history": [],
+    }
+
+
+def _tr_apply_event(st: Dict[str, Any], ev_type, by_custid, data) -> None:
+    """Append to the event ring; mirror stint_complete into stint_history so a
+    late joiner sees completed stints even after they roll off the ring."""
+    st["last_seq"] += 1
+    st["events"].append({"seq": st["last_seq"], "type": ev_type,
+                         "by_custid": by_custid, "ts": _now(), "data": data or {}})
+    if len(st["events"]) > _TR_EVENT_RING:
+        st["events"] = st["events"][-_TR_EVENT_RING:]
+    if ev_type == "stint_complete":
+        st.setdefault("stint_history", []).append(dict(data or {}))
+        if len(st["stint_history"]) > _TR_HISTORY_MAX:
+            st["stint_history"] = st["stint_history"][-_TR_HISTORY_MAX:]
+
+
+def _tr_member(custid, role, name=None) -> Dict[str, Any]:
+    return {"custid": custid, "name": name, "role": role, "online": True,
+            "tier_ok": True, "last_seen": _now()}
+
+
+def _tr_touch(state: Dict[str, Any], custid) -> None:
+    for m in state["room"]["members"]:
+        if m["custid"] == custid:
+            m["online"] = True
+            m["last_seen"] = _now()
+    for m in state["room"]["members"]:
+        if (_now() - m.get("last_seen", 0)) > 10.0:
+            m["online"] = False
+
+
+def _tr_public(state: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in state.items() if not k.startswith("_")}
+
+
+def _tr_resolve(member_token):
+    tok = _TR_TOKENS.get(member_token or "")
+    if not tok:
+        return None, None
+    return _TR_ROOMS.get(tok["code"]), tok
+
+
+# --------------------------------------------------------------- store actions
+def tr_create_room(email, license_token, my_id, race_session_id=None, install_id=None):
+    if not verify_pro_plus(email, license_token, install_id):
+        return {"error": "pro_plus_required"}, 403
+    with _TR_LOCK:
+        _tr_reap()
+        code = _tr_gen_code()
+        st = _tr_new_state(code, my_id)
+        st["room"]["race_session_id"] = race_session_id
+        st["room"]["members"].append(_tr_member(my_id, "host"))
+        token = _tr_secrets.token_urlsafe(18)
+        _TR_TOKENS[token] = {"code": code, "custid": my_id}
+        _TR_ROOMS[code] = st
+        print(f"[team] room {code} created by custid={my_id} ({email})")
+        return {"room_code": code, "member_token": token, "state": _tr_public(st)}, 200
+
+
+def tr_join_room(email, license_token, my_id, room_code, install_id=None):
+    if not verify_pro_plus(email, license_token, install_id):
+        return {"error": "pro_plus_required"}, 403
+    with _TR_LOCK:
+        _tr_reap()
+        st = _TR_ROOMS.get((room_code or "").upper())
+        if not st:
+            return {"error": "no_such_room"}, 404
+        if st["room"].get("locked"):
+            return {"error": "room_locked"}, 403
+        members = st["room"]["members"]
+        if my_id is not None and not any(m["custid"] == my_id for m in members):
+            if len(members) >= _TR_MAX_MEMBERS:
+                return {"error": "room_full"}, 403
+            members.append(_tr_member(my_id, "driver"))
+            st["version"] += 1
+        token = _tr_secrets.token_urlsafe(18)
+        _TR_TOKENS[token] = {"code": st["room"]["code"], "custid": my_id}
+        print(f"[team] custid={my_id} joined room {st['room']['code']}")
+        return {"room_code": st["room"]["code"], "member_token": token,
+                "state": _tr_public(st)}, 200
+
+
+def tr_heartbeat(member_token, my_id, live=None, events=None):
+    with _TR_LOCK:
+        st, tok = _tr_resolve(member_token)
+        if not st:
+            return {"error": "unknown_token"}, 401
+        _tr_touch(st, tok["custid"])
+        changed = False
+        if isinstance(live, dict) and live:
+            st["live"] = live
+            if live.get("active_custid") is not None:
+                st["live"]["active_custid"] = live["active_custid"]
+            changed = True
+        for ev in (events or []):
+            _tr_apply_event(st, ev.get("type"), tok["custid"], ev.get("data"))
+            changed = True
+        if changed:
+            st["version"] += 1
+        return {"state": _tr_public(st)}, 200
+
+
+def tr_get_state(room_code, member_token):
+    with _TR_LOCK:
+        st, _ = _tr_resolve(member_token)
+        if not st:
+            st = _TR_ROOMS.get((room_code or "").upper())
+        if not st:
+            return {"error": "no_such_room"}, 404
+        return _tr_public(st), 200
+
+
+def tr_update_plan(member_token, plan, base_version):
+    with _TR_LOCK:
+        st, tok = _tr_resolve(member_token)
+        if not st:
+            return {"error": "unknown_token"}, 401
+        if st["room"]["host_custid"] != tok["custid"]:
+            return {"error": "host_only"}, 403
+        if base_version is not None and int(base_version) != int(st["version"]):
+            # Compare-and-swap miss: hand back the current state so the client
+            # can rebase and retry rather than clobbering someone else's edit.
+            return {"error": "version_conflict", "state": _tr_public(st)}, 409
+        st["plan"] = plan or {}
+        st["plan"]["version"] = st["plan"].get("version", 1) + 1
+        st["version"] += 1
+        return {"state": _tr_public(st)}, 200
+
+
+def tr_add_event(member_token, event):
+    with _TR_LOCK:
+        st, tok = _tr_resolve(member_token)
+        if not st:
+            return {"error": "unknown_token"}, 401
+        _tr_apply_event(st, (event or {}).get("type"), tok["custid"], (event or {}).get("data"))
+        st["version"] += 1
+        return {"ok": True, "seq": st["last_seq"]}, 200
+
+
+def tr_leave(member_token):
+    with _TR_LOCK:
+        st, tok = _tr_resolve(member_token)
+        _TR_TOKENS.pop(member_token or "", None)
+        if st and tok:
+            for m in st["room"]["members"]:
+                if m["custid"] == tok["custid"]:
+                    m["online"] = False
+        return {"ok": True}, 200
+
+
+# ------------------------------------------------------------------ HTTP glue
+class TeamCreateIn(BaseModel):
+    email: str = ""
+    license_token: str = ""
+    my_id: Optional[int] = None
+    race_session_id: Optional[Any] = None
+    install_id: Optional[str] = None
+
+
+class TeamJoinIn(BaseModel):
+    email: str = ""
+    license_token: str = ""
+    my_id: Optional[int] = None
+    room_code: str = ""
+    install_id: Optional[str] = None
+
+
+class TeamHeartbeatIn(BaseModel):
+    member_token: str = ""
+    my_id: Optional[int] = None
+    live: Optional[Dict[str, Any]] = None
+    events: Optional[List[Dict[str, Any]]] = None
+
+
+class TeamPlanIn(BaseModel):
+    member_token: str = ""
+    plan: Dict[str, Any] = {}
+    base_version: Optional[int] = None
+
+
+class TeamEventIn(BaseModel):
+    member_token: str = ""
+    event: Dict[str, Any] = {}
+
+
+class TeamLeaveIn(BaseModel):
+    member_token: str = ""
+
+
+def _tr_reply(response: Response, pair):
+    body, code = pair
+    response.status_code = int(code)
+    return body
+
+
+@app.post("/team/create")
+def team_create(body: TeamCreateIn, response: Response) -> Dict[str, Any]:
+    return _tr_reply(response, tr_create_room(body.email, body.license_token, body.my_id,
+                                              body.race_session_id, body.install_id))
+
+
+@app.post("/team/join")
+def team_join(body: TeamJoinIn, response: Response) -> Dict[str, Any]:
+    return _tr_reply(response, tr_join_room(body.email, body.license_token, body.my_id,
+                                            body.room_code, body.install_id))
+
+
+@app.post("/team/heartbeat")
+def team_heartbeat(body: TeamHeartbeatIn, response: Response) -> Dict[str, Any]:
+    return _tr_reply(response, tr_heartbeat(body.member_token, body.my_id,
+                                            body.live, body.events))
+
+
+@app.post("/team/plan")
+def team_plan(body: TeamPlanIn, response: Response) -> Dict[str, Any]:
+    return _tr_reply(response, tr_update_plan(body.member_token, body.plan, body.base_version))
+
+
+@app.post("/team/event")
+def team_event(body: TeamEventIn, response: Response) -> Dict[str, Any]:
+    return _tr_reply(response, tr_add_event(body.member_token, body.event))
+
+
+@app.post("/team/leave")
+def team_leave(body: TeamLeaveIn, response: Response) -> Dict[str, Any]:
+    return _tr_reply(response, tr_leave(body.member_token))
+
+
+@app.get("/team/state")
+def team_state(response: Response, room_code: str = "", member_token: str = "") -> Dict[str, Any]:
+    return _tr_reply(response, tr_get_state(room_code, member_token))
+
+
+@app.get("/team/health")
+def team_health() -> Dict[str, Any]:
+    """Unauthenticated liveness only. Deliberately returns COUNTS, never room
+    codes — a room code is the join credential."""
+    with _TR_LOCK:
+        _tr_reap()
+        return {"ok": True, "rooms": len(_TR_ROOMS), "tokens": len(_TR_TOKENS),
+                "enforce": TEAM_RELAY_ENFORCE}
+
+
+@app.get("/admin/team/rooms")
+def admin_team_rooms(
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """Admin view of live rooms — for debugging a teammate test."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    with _TR_LOCK:
+        rooms = []
+        for code, st in _TR_ROOMS.items():
+            rm = st.get("room", {})
+            rooms.append({
+                "code": code,
+                "age_s": round(_now() - st.get("_created", _now()), 1),
+                "version": st.get("version"),
+                "host_custid": rm.get("host_custid"),
+                "members": [{"custid": m.get("custid"), "role": m.get("role"),
+                             "online": m.get("online")} for m in rm.get("members", [])],
+                "stints": len((st.get("plan") or {}).get("stints") or []),
+                "events": len(st.get("events") or []),
+                "stint_history": len(st.get("stint_history") or []),
+                "active_custid": (st.get("live") or {}).get("active_custid"),
+            })
+        return {"ok": True, "enforce": TEAM_RELAY_ENFORCE, "rooms": rooms}
