@@ -2920,16 +2920,27 @@ def tr_heartbeat(member_token, my_id, live=None, events=None):
         if not st:
             return {"error": "unknown_token"}, 401
         _tr_touch(st, tok["custid"])
-        changed = False
+        # `version` is the STRUCTURAL version: roster, plan, stint history. Clients
+        # rebuild their UI on it, and update_plan uses it as a compare-and-swap token.
+        #
+        # A live telemetry payload must NOT bump it. The ACTIVE client pushes live
+        # every 2s, so bumping version there churned it constantly, with two effects:
+        #   1. the pit-wall tab tore down and rebuilt its roster/timeline every 2s —
+        #      visible as flicker and the scroll position snapping back to the top;
+        #   2. worse, base_version went stale within 2 seconds, so the host saving a
+        #      stint plan would 409 version_conflict almost every time.
+        # Live gets its own counter so a UI can still tell that the numbers moved.
+        structural = False
         if isinstance(live, dict) and live:
             st["live"] = live
             if live.get("active_custid") is not None:
                 st["live"]["active_custid"] = live["active_custid"]
-            changed = True
+            st["live_seq"] = int(st.get("live_seq", 0)) + 1
         for ev in (events or []):
+            # Events mutate stint_history, which IS structural.
             _tr_apply_event(st, ev.get("type"), tok["custid"], ev.get("data"))
-            changed = True
-        if changed:
+            structural = True
+        if structural:
             st["version"] += 1
         return {"state": _tr_public(st)}, 200
 
