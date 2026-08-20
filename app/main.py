@@ -1880,9 +1880,12 @@ async def prime_recording(
                 with _pg_conn() as conn:
                     with conn.cursor() as cur:
                         cur.execute(
-                            "INSERT INTO prime_recordings (uuid, meta, path, bytes) "
-                            "VALUES (%s, %s, %s, %s)",
-                            (uuid, psycopg2.extras.Json(meta), str(fpath), len(blob)),
+                            "INSERT INTO prime_recordings "
+                            "(uuid, meta, path, bytes, file, track, car, session_type, ticks, status) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')",
+                            (uuid, psycopg2.extras.Json(meta), str(fpath), len(blob), fname,
+                             str(meta.get("track") or ""), str(meta.get("car") or ""),
+                             str(meta.get("session_type") or ""), ticks),
                         )
                     conn.commit()
                 stored = True
@@ -2021,6 +2024,14 @@ def qa_findings_post(
                 conn.commit()
             stored = True
             print(f"[qa] finding {body.status} worker={body.worker} file={body.recording_file}")
+            # Mark the recording processed and decide -- once, here -- whether it joins
+            # the permanent corpus. Never let a keep-rule failure fail the finding POST:
+            # the finding ledger is the valuable artefact and must always land.
+            try:
+                _apply_keep_rules(body.recording_file, body.status, body.ticks,
+                                  body.track, body.car)
+            except Exception as _e:
+                print(f"[retention] keep-rule hook failed: {_e}")
         except Exception as e:
             print(f"[qa] DB write error: {e}")
     if not stored:
@@ -2270,3 +2281,365 @@ def qa_dashboard() -> Any:
     """Lugnut QA dashboard — phone + desktop. The page shell loads without auth; it
     prompts for the control key and uses it to fetch the findings feed."""
     return HTMLResponse(_QA_DASHBOARD_HTML)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# QA RECORDING RETENTION  (Part A of claude/RECORDING_RETENTION_DESIGN.md,
+# plus the golden-corpus keep-rules from claude/GOLDEN_CORPUS_RETENTION_SPEC.md)
+#
+# WHY THIS EXISTS: the volume is a TRANSIENT INBOX, not an archive. A recording's
+# job is to be replayed once by a lugnut; after that the FINDING is the valuable
+# artefact and the raw gzip is spent fuel. Without pruning, the 5 GB volume wedges
+# and uploads start failing, which silently kills the whole QA pipeline.
+#
+# MEASURED SIZING (claude/LEAN_RECORDER_VALIDATION_2026-08-20.md): with the v2
+# delta recorder a race is ~24 MB, NOT the ~5 MB the design assumed. That is
+# ~210 recordings in 5 GB and only ~3-6 hours of peak-night buffer, so DAILY
+# cleanup is not enough at the mid/heavy scenarios — run this hourly, and have
+# the lugnut prune each clean recording the moment it finishes replaying it.
+#
+# SAFETY: CLEANUP_DRY_RUN defaults to TRUE. The first deploy cannot delete
+# anything — it only logs what it would remove. Flip CLEANUP_DRY_RUN=0 once the
+# delete list looks sane.
+# ══════════════════════════════════════════════════════════════════════════════
+
+import random as _rnd
+
+RETAIN_CLEAN_DAYS       = int(os.getenv("RETAIN_CLEAN_DAYS", "3"))
+COVERAGE_KEEP_PER_COMBO = int(os.getenv("COVERAGE_KEEP_PER_COMBO", "2"))
+STORAGE_BUDGET_GB       = float(os.getenv("STORAGE_BUDGET_GB", "4"))
+CLEANUP_DRY_RUN         = (os.getenv("CLEANUP_DRY_RUN", "1").strip() != "0")
+GOLDEN_RANDOM_RATE      = float(os.getenv("GOLDEN_RANDOM_RATE", "0.02"))
+GOLDEN_LONG_KEEP        = int(os.getenv("GOLDEN_LONG_KEEP", "10"))
+GOLDEN_LONG_MIN_TICKS   = int(os.getenv("GOLDEN_LONG_MIN_TICKS", "20000"))
+
+# Territory the harness has little or no coverage for. Recordings matching any of
+# these are pinned unconditionally — they are the ones a future invariant will
+# most need, and today we have ZERO real endurance/team recordings.
+UNDERTESTED_TOKENS = tuple(
+    t.strip().lower() for t in
+    os.getenv("UNDERTESTED_TOKENS",
+              "endurance,team,wet,rain,superspeedway,standing,timed").split(",")
+    if t.strip()
+)
+
+
+def _migrate_recordings_retention() -> None:
+    """Additive schema migration. Every column is nullable/defaulted so existing
+    rows migrate cleanly and a re-run is a no-op."""
+    if not _PG_URL:
+        return
+    try:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    ALTER TABLE prime_recordings
+                        ADD COLUMN IF NOT EXISTS file         TEXT,
+                        ADD COLUMN IF NOT EXISTS track        TEXT,
+                        ADD COLUMN IF NOT EXISTS car          TEXT,
+                        ADD COLUMN IF NOT EXISTS session_type TEXT,
+                        ADD COLUMN IF NOT EXISTS ticks        INTEGER DEFAULT 0,
+                        ADD COLUMN IF NOT EXISTS status       TEXT DEFAULT 'pending',
+                        ADD COLUMN IF NOT EXISTS finding      TEXT,
+                        ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ,
+                        ADD COLUMN IF NOT EXISTS pinned       BOOLEAN DEFAULT FALSE,
+                        ADD COLUMN IF NOT EXISTS pin_reason   TEXT,
+                        ADD COLUMN IF NOT EXISTS pruned       BOOLEAN DEFAULT FALSE,
+                        ADD COLUMN IF NOT EXISTS pruned_at    TIMESTAMPTZ;
+                    CREATE INDEX IF NOT EXISTS prime_rec_file_idx   ON prime_recordings(file);
+                    CREATE INDEX IF NOT EXISTS prime_rec_status_idx ON prime_recordings(status);
+                    -- Backfill `file` for rows written before this column existed.
+                    UPDATE prime_recordings
+                       SET file = regexp_replace(path, '^.*[/\\\\]', '')
+                     WHERE file IS NULL AND path IS NOT NULL;
+                """)
+            conn.commit()
+        print("[retention] schema ready")
+    except Exception as e:
+        print(f"[retention] migration error: {e}")
+
+
+_migrate_recordings_retention()
+
+
+def _is_undertested(track: str, car: str, session_type: str, meta: Optional[Dict[str, Any]] = None) -> bool:
+    blob = " ".join(str(x or "") for x in (track, car, session_type)).lower()
+    if meta:
+        try:
+            blob += " " + json.dumps(meta).lower()
+        except Exception:
+            pass
+    return any(tok in blob for tok in UNDERTESTED_TOKENS)
+
+
+def _pin(cur, fname: str, reason: str) -> None:
+    cur.execute("UPDATE prime_recordings SET pinned = TRUE, pin_reason = COALESCE(pin_reason, %s) "
+                "WHERE file = %s", (reason, fname))
+
+
+def _apply_keep_rules(fname: str, finding: str, ticks: int,
+                      track: str = "", car: str = "", session_type: str = "") -> Optional[str]:
+    """Called when a lugnut reports a finding. Marks the recording processed and
+    decides — ONCE, HERE — whether it joins the permanent corpus.
+
+    The random roll happens at FINDING time on purpose. Rolling at prune time
+    would bias the corpus toward whatever happened to survive long enough to be
+    considered, which is exactly the selection effect a random sample exists to
+    avoid. Returns the pin reason, or None."""
+    if not _PG_URL:
+        return None
+    reason = None
+    try:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE prime_recordings SET status='processed', finding=%s, "
+                    "processed_at=NOW(), ticks=GREATEST(COALESCE(ticks,0), %s), "
+                    "track=COALESCE(NULLIF(track,''),%s), car=COALESCE(NULLIF(car,''),%s) "
+                    "WHERE file=%s",
+                    (finding, int(ticks or 0), track, car, fname))
+                # Read the row back: session_type and the true tick count come from the
+                # recording HEADER at upload time, not from the worker's finding payload.
+                cur.execute("SELECT track, car, session_type, ticks FROM prime_recordings "
+                            "WHERE file=%s", (fname,))
+                _r = cur.fetchone() or (track, car, session_type, ticks)
+                track, car, session_type = _r[0] or "", _r[1] or "", _r[2] or ""
+                ticks = int(_r[3] or ticks or 0)
+
+                # 1. Found a bug -> regression corpus. Never auto-deleted.
+                if finding == "found":
+                    reason = "found"
+                # 2. Undertested territory -> pin until the harness covers it.
+                elif _is_undertested(track, car, session_type):
+                    reason = "undertested"
+                # 3. Long race -> exercises second pit windows, fuel crossovers,
+                #    swaps that a sprint never reaches.
+                elif int(ticks or 0) >= GOLDEN_LONG_MIN_TICKS:
+                    cur.execute("SELECT COUNT(*) FROM prime_recordings "
+                                "WHERE pin_reason='golden_long' AND NOT pruned")
+                    if int(cur.fetchone()[0]) < GOLDEN_LONG_KEEP:
+                        reason = "golden_long"
+                # 4. Unbiased random sample — the only rule that can catch a bug
+                #    class nobody has thought to bucket for yet.
+                if reason is None and finding == "clean" and _rnd.random() < GOLDEN_RANDOM_RATE:
+                    reason = "golden_random"
+
+                if reason:
+                    _pin(cur, fname, reason)
+            conn.commit()
+        if reason:
+            print(f"[retention] pinned {fname} ({reason})")
+    except Exception as e:
+        print(f"[retention] keep-rule error for {fname}: {e}")
+    return reason
+
+
+def plan_cleanup(rows: List[Dict[str, Any]], now_ts: float,
+                 budget_bytes: float, retain_days: int, coverage_keep: int) -> Dict[str, Any]:
+    """PURE decision function — no DB, no filesystem. Given the recording rows,
+    return which files to prune and why each survivor was kept.
+
+    Split out from the endpoint so the rules can be unit-tested without a
+    database; the delete path is the one place a bug is unrecoverable.
+
+    Hard invariants (never violated, in this order):
+      * pinned, finding='found', finding='error', or status != 'processed'
+        are NEVER pruned. Unprocessed means a lugnut has not looked yet, and we
+        never delete data before it has been looked at even once.
+      * the coverage sample (newest N clean per track/car/session) is kept.
+      * only then: age-prune, then size-cap eviction oldest-first.
+    """
+    protected, candidates = [], []
+    for r in rows:
+        if r.get("pruned"):
+            continue
+        if (r.get("pinned") or r.get("finding") in ("found", "error")
+                or (r.get("status") or "pending") != "processed"):
+            protected.append(r)
+        else:
+            candidates.append(r)
+
+    # Coverage sample: newest N clean per (track, car, session_type).
+    combos: Dict[tuple, List[Dict[str, Any]]] = {}
+    for r in candidates:
+        if r.get("finding") == "clean":
+            key = (r.get("track") or "", r.get("car") or "", r.get("session_type") or "")
+            combos.setdefault(key, []).append(r)
+    keep_coverage = set()
+    for key, group in combos.items():
+        group.sort(key=lambda x: float(x.get("created_at") or 0), reverse=True)
+        for r in group[:max(0, coverage_keep)]:
+            keep_coverage.add(r.get("file"))
+
+    prunable = [r for r in candidates if r.get("file") not in keep_coverage]
+
+    cutoff = now_ts - (retain_days * 86400.0)
+    to_prune = [r for r in prunable
+                if r.get("finding") == "clean" and float(r.get("created_at") or 0) < cutoff]
+    pruned_files = {r.get("file") for r in to_prune}
+
+    # Size-cap eviction: belt-and-suspenders so a peak-night flood can never wedge
+    # the volume even if nothing has aged out yet.
+    def _total(rs):
+        return sum(float(r.get("bytes") or 0) for r in rs)
+
+    remaining = [r for r in rows if not r.get("pruned") and r.get("file") not in pruned_files]
+    evictable = sorted([r for r in prunable if r.get("file") not in pruned_files],
+                       key=lambda x: float(x.get("created_at") or 0))
+    evicted_for_size = []
+    while _total(remaining) > budget_bytes and evictable:
+        victim = evictable.pop(0)
+        to_prune.append(victim)
+        evicted_for_size.append(victim.get("file"))
+        pruned_files.add(victim.get("file"))
+        remaining = [r for r in remaining if r.get("file") != victim.get("file")]
+
+    return {
+        "to_prune": to_prune,
+        "pruned_files": sorted(f for f in pruned_files if f),
+        "evicted_for_size": evicted_for_size,
+        "protected": len(protected),
+        "coverage_kept": sorted(f for f in keep_coverage if f),
+        "bytes_after": _total(remaining),
+        "freed_bytes": sum(float(r.get("bytes") or 0) for r in to_prune),
+    }
+
+
+@app.post("/admin/recordings/cleanup")
+def admin_recordings_cleanup(
+    dry_run: Optional[bool] = None,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """Prune spent raw recordings. Idempotent; only ever unlinks the gzip, never a
+    DB row and never a finding — the finding ledger is the permanent QA history.
+
+    Run HOURLY (Railway cron). Daily is too slow: at ~24 MB a race the heavy
+    scenario puts more than the whole budget on the volume in a single evening."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    if not _PG_URL:
+        raise HTTPException(status_code=503, detail="cleanup requires the Postgres index")
+
+    is_dry = CLEANUP_DRY_RUN if dry_run is None else bool(dry_run)
+    rows: List[Dict[str, Any]] = []
+    try:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT file, path, bytes, ticks, track, car, session_type, status, "
+                    "finding, pinned, pin_reason, pruned, EXTRACT(EPOCH FROM received_at) "
+                    "FROM prime_recordings WHERE COALESCE(pruned, FALSE) = FALSE")
+                for t in cur.fetchall():
+                    rows.append({
+                        "file": t[0], "path": t[1], "bytes": t[2], "ticks": t[3],
+                        "track": t[4], "car": t[5], "session_type": t[6], "status": t[7],
+                        "finding": t[8], "pinned": t[9], "pin_reason": t[10],
+                        "pruned": t[11], "created_at": t[12],
+                    })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="index read failed: %s" % e)
+
+    plan = plan_cleanup(rows, _now(), STORAGE_BUDGET_GB * 1e9,
+                        RETAIN_CLEAN_DAYS, COVERAGE_KEEP_PER_COMBO)
+
+    deleted = 0
+    if not is_dry:
+        for r in plan["to_prune"]:
+            fname = r.get("file")
+            try:
+                p = Path(r.get("path") or (RECORDINGS_DIR / (fname or "")))
+                if p.exists():
+                    p.unlink()
+                with _pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE prime_recordings SET pruned = TRUE, pruned_at = NOW() "
+                                    "WHERE file = %s", (fname,))
+                    conn.commit()
+                deleted += 1
+            except Exception as e:
+                print(f"[retention] prune failed for {fname}: {e}")
+
+    out = {
+        "ok": True, "dry_run": is_dry,
+        "considered": len(rows), "protected": plan["protected"],
+        "would_prune" if is_dry else "pruned": len(plan["to_prune"]),
+        "deleted": deleted,
+        "freed_mb": round(plan["freed_bytes"] / 1e6, 1),
+        "budget_gb": STORAGE_BUDGET_GB,
+        "used_gb_after": round(plan["bytes_after"] / 1e9, 3),
+        "evicted_for_size": len(plan["evicted_for_size"]),
+        "coverage_kept": len(plan["coverage_kept"]),
+        "files": plan["pruned_files"][:200],
+    }
+    print(f"[retention] cleanup dry_run={is_dry} considered={len(rows)} "
+          f"prune={len(plan['to_prune'])} freed_mb={out['freed_mb']}")
+    return out
+
+
+@app.post("/admin/recording/{fname}/pin")
+def admin_recording_pin(
+    fname: str,
+    unpin: bool = False,
+    reason: str = "manual",
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """Hand-pin (or release) a recording so cleanup never touches it."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    if not _PG_URL:
+        raise HTTPException(status_code=503, detail="pin requires the Postgres index")
+    safe = "".join(ch for ch in fname if ch.isalnum() or ch in "._-")
+    try:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                if unpin:
+                    cur.execute("UPDATE prime_recordings SET pinned=FALSE, pin_reason=NULL "
+                                "WHERE file=%s", (safe,))
+                else:
+                    cur.execute("UPDATE prime_recordings SET pinned=TRUE, pin_reason=%s "
+                                "WHERE file=%s", (reason, safe))
+            conn.commit()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"ok": True, "file": safe, "pinned": not unpin, "reason": None if unpin else reason}
+
+
+@app.get("/admin/recordings/storage")
+def admin_recordings_storage(
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """Storage banner for /admin/qa: how full the inbox is and what is being kept."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    if not _PG_URL:
+        return {"ok": False, "detail": "no Postgres index"}
+    out: Dict[str, Any] = {"ok": True, "budget_gb": STORAGE_BUDGET_GB}
+    try:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COALESCE(SUM(bytes),0), COUNT(*) FROM prime_recordings "
+                            "WHERE COALESCE(pruned,FALSE)=FALSE")
+                b, n = cur.fetchone()
+                out["raw_gb"] = round(float(b or 0) / 1e9, 3)
+                out["kept"] = int(n or 0)
+                cur.execute("SELECT COUNT(*) FROM prime_recordings WHERE COALESCE(pruned,FALSE)=TRUE")
+                out["pruned"] = int(cur.fetchone()[0])
+                cur.execute("SELECT COALESCE(pin_reason,'manual'), COUNT(*) FROM prime_recordings "
+                            "WHERE pinned AND NOT COALESCE(pruned,FALSE) GROUP BY 1")
+                out["pinned_by_reason"] = {r[0]: int(r[1]) for r in cur.fetchall()}
+                cur.execute("SELECT COUNT(*) FROM prime_recordings "
+                            "WHERE COALESCE(status,'pending')<>'processed' AND NOT COALESCE(pruned,FALSE)")
+                out["unprocessed"] = int(cur.fetchone()[0])
+    except Exception as e:
+        return {"ok": False, "detail": str(e)}
+    out["pct_of_budget"] = round(100.0 * out.get("raw_gb", 0) / max(0.001, STORAGE_BUDGET_GB), 1)
+    return out
