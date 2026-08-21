@@ -2815,7 +2815,12 @@ def _tr_gen_code() -> str:
 
 
 def _tr_reap() -> None:
-    dead = [c for c, r in _TR_ROOMS.items() if (_now() - r.get("_created", 0)) > _TR_ROOM_TTL_S]
+    # Age from LAST ACTIVITY, not creation. Reaping 8h after _created killed a 24h
+    # room at hour 8 -- mid-race, with everyone still heartbeating into it. It also
+    # punished the thing we now expect people to do: open the room early, build the
+    # stint plan, and come back at green.
+    dead = [c for c, r in _TR_ROOMS.items()
+            if (_now() - max(r.get("_touched", 0), r.get("_created", 0))) > _TR_ROOM_TTL_S]
     for c in dead:
         if _TR_ROOMS.pop(c, None):
             for t in [t for t, v in _TR_TOKENS.items() if v.get("code") == c]:
@@ -2826,9 +2831,10 @@ def _tr_reap() -> None:
 
 def _tr_new_state(code: str, host_custid) -> Dict[str, Any]:
     return {
-        "version": 1, "last_seq": 0, "_created": _now(),
+        "version": 1, "last_seq": 0, "_created": _now(), "_touched": _now(),
+        "_next_mid": 1,
         "room": {"code": code, "created_at": _now(), "host_custid": host_custid,
-                 "locked": False, "members": []},
+                 "host_mid": None, "locked": False, "members": []},
         "plan": {"version": 1, "stints": [], "alert_lead_min": 5},
         "live": {}, "resources": {}, "events": [], "stint_history": [],
     }
@@ -2848,14 +2854,86 @@ def _tr_apply_event(st: Dict[str, Any], ev_type, by_custid, data) -> None:
             st["stint_history"] = st["stint_history"][-_TR_HISTORY_MAX:]
 
 
-def _tr_member(custid, role, name=None) -> Dict[str, Any]:
-    return {"custid": custid, "name": name, "role": role, "online": True,
-            "tier_ok": True, "last_seen": _now()}
+# ===================================================================
+# IDENTITY
+#
+# A member used to BE its iRacing customer id. That made custid the primary key
+# for the roster, the plan, live.active_custid and stint history -- and the id
+# only exists once you are loaded into a session. Join before that and every one
+# of those keys was None: the roster read "Driver None", a teammate joining the
+# same way was never added at all (the append is guarded on my_id is not None),
+# and _tr_touch could not match anybody, so everyone showed offline forever.
+#
+# Now each member gets a stable `mid` at join. The plan and the roster reference
+# THAT. `custid` is an attribute filled in later, when Chief connects to iRacing
+# and the heartbeat carries it -- see _tr_claim_custid. So you can open a room,
+# name yourself and build the whole stint plan before the sim is even running.
+# ===================================================================
+def _tr_next_mid(st: Dict[str, Any]) -> str:
+    n = int(st.get("_next_mid", 1))
+    st["_next_mid"] = n + 1
+    return "m%d" % n
 
 
-def _tr_touch(state: Dict[str, Any], custid) -> None:
+def _tr_unique_name(st: Dict[str, Any], name: str) -> str:
+    """Two people typing "Kory" is unambiguous internally (mid) and useless on a
+    pit wall. Suffix the second one."""
+    base = (name or "").strip()[:24] or "Driver"
+    taken = {(m.get("name") or "").strip().lower() for m in st["room"]["members"]}
+    if base.lower() not in taken:
+        return base
+    for i in range(2, 20):
+        cand = "%s (%d)" % (base, i)
+        if cand.lower() not in taken:
+            return cand
+    return base
+
+
+def _tr_member(custid, role, name=None, mid=None, install_id=None) -> Dict[str, Any]:
+    return {"mid": mid, "custid": custid, "name": name, "install_id": install_id,
+            "role": role, "online": True, "tier_ok": True, "last_seen": _now()}
+
+
+def _tr_find(st: Dict[str, Any], mid) -> Optional[Dict[str, Any]]:
+    for m in st["room"]["members"]:
+        if m.get("mid") == mid:
+            return m
+    return None
+
+
+def _tr_claim_custid(st: Dict[str, Any], mid, custid) -> bool:
+    """Lock an iRacing id onto a member, ONCE.
+
+    Called from the heartbeat, which starts carrying my_id the moment Chief binds
+    it from the SDK. Only fills a member whose custid is still None: a different id
+    arriving on the same token later is ignored, otherwise a reconnect could
+    silently take over a teammate's seat and their stints.
+
+    On the claim, backfill every stint the member owns. The endurance engine
+    matches stints on driver_custid, so a plan built in the garage -- when nobody
+    had an id yet -- only starts working at exactly this moment.
+    """
+    if custid is None:
+        return False
+    m = _tr_find(st, mid)
+    if m is None or m.get("custid") is not None:
+        return False
+    if any(x.get("custid") == custid for x in st["room"]["members"]):
+        return False                      # that id already belongs to someone here
+    m["custid"] = custid
+    if st["room"].get("host_mid") == mid:
+        st["room"]["host_custid"] = custid
+    for s_ in (st.get("plan", {}) or {}).get("stints", []) or []:
+        if s_.get("mid") == mid and s_.get("driver_custid") is None:
+            s_["driver_custid"] = custid
+    print("[team] room %s: %s claimed custid=%s" % (st["room"]["code"], mid, custid))
+    return True
+
+
+def _tr_touch(state: Dict[str, Any], mid) -> None:
+    state["_touched"] = _now()
     for m in state["room"]["members"]:
-        if m["custid"] == custid:
+        if m.get("mid") == mid:
             m["online"] = True
             m["last_seen"] = _now()
     for m in state["room"]["members"]:
@@ -2875,7 +2953,8 @@ def _tr_resolve(member_token):
 
 
 # --------------------------------------------------------------- store actions
-def tr_create_room(email, license_token, my_id, race_session_id=None, install_id=None):
+def tr_create_room(email, license_token, my_id, race_session_id=None, install_id=None,
+                   name=None):
     if not verify_pro_plus(email, license_token, install_id):
         return {"error": "pro_plus_required"}, 403
     with _TR_LOCK:
@@ -2883,15 +2962,19 @@ def tr_create_room(email, license_token, my_id, race_session_id=None, install_id
         code = _tr_gen_code()
         st = _tr_new_state(code, my_id)
         st["room"]["race_session_id"] = race_session_id
-        st["room"]["members"].append(_tr_member(my_id, "host"))
+        mid = _tr_next_mid(st)
+        st["room"]["host_mid"] = mid
+        st["room"]["members"].append(
+            _tr_member(my_id, "host", name=_tr_unique_name(st, name or "Host"),
+                       mid=mid, install_id=install_id))
         token = _tr_secrets.token_urlsafe(18)
-        _TR_TOKENS[token] = {"code": code, "custid": my_id}
+        _TR_TOKENS[token] = {"code": code, "custid": my_id, "mid": mid}
         _TR_ROOMS[code] = st
-        print(f"[team] room {code} created by custid={my_id} ({email})")
+        print(f"[team] room {code} created by {mid} custid={my_id} ({email})")
         return {"room_code": code, "member_token": token, "state": _tr_public(st)}, 200
 
 
-def tr_join_room(email, license_token, my_id, room_code, install_id=None):
+def tr_join_room(email, license_token, my_id, room_code, install_id=None, name=None):
     if not verify_pro_plus(email, license_token, install_id):
         return {"error": "pro_plus_required"}, 403
     with _TR_LOCK:
@@ -2902,14 +2985,50 @@ def tr_join_room(email, license_token, my_id, room_code, install_id=None):
         if st["room"].get("locked"):
             return {"error": "room_locked"}, 403
         members = st["room"]["members"]
-        if my_id is not None and not any(m["custid"] == my_id for m in members):
+
+        # RECONNECT TO YOUR OWN SEAT. Setting up early means people close Chief and
+        # come back at green; without this they would return as a SECOND member and
+        # the stint plan would point at the seat they abandoned. Match the machine
+        # first (install_id), then the iRacing id if we already have one.
+        seat = None
+        for m in members:
+            if install_id and m.get("install_id") and m["install_id"] == install_id:
+                seat = m
+                break
+            if my_id is not None and m.get("custid") == my_id:
+                seat = m
+                break
+
+        if seat is None:
             if len(members) >= _TR_MAX_MEMBERS:
                 return {"error": "room_full"}, 403
-            members.append(_tr_member(my_id, "driver"))
+            mid = _tr_next_mid(st)
+            seat = _tr_member(my_id, "driver",
+                              name=_tr_unique_name(st, name or "Driver"),
+                              mid=mid, install_id=install_id)
+            members.append(seat)
             st["version"] += 1
+        else:
+            mid = seat.get("mid") or _tr_next_mid(st)
+            seat["mid"] = mid
+            seat["online"] = True
+            seat["last_seen"] = _now()
+            if install_id and not seat.get("install_id"):
+                seat["install_id"] = install_id
+            # A name typed on this rejoin wins -- it is the most recent thing the
+            # driver actually said about themselves.
+            if name and (name or "").strip() != (seat.get("name") or ""):
+                seat["name"] = _tr_unique_name(st, name)
+                st["version"] += 1
+
+        if my_id is not None:
+            _tr_claim_custid(st, mid, my_id)
+
         token = _tr_secrets.token_urlsafe(18)
-        _TR_TOKENS[token] = {"code": st["room"]["code"], "custid": my_id}
-        print(f"[team] custid={my_id} joined room {st['room']['code']}")
+        _TR_TOKENS[token] = {"code": st["room"]["code"], "custid": my_id, "mid": mid}
+        _tr_touch(st, mid)
+        print(f"[team] {mid} ({seat.get('name')}) joined room {st['room']['code']}"
+              f" custid={my_id}")
         return {"room_code": st["room"]["code"], "member_token": token,
                 "state": _tr_public(st)}, 200
 
@@ -2919,7 +3038,14 @@ def tr_heartbeat(member_token, my_id, live=None, events=None):
         st, tok = _tr_resolve(member_token)
         if not st:
             return {"error": "unknown_token"}, 401
-        _tr_touch(st, tok["custid"])
+        _tr_touch(st, tok.get("mid"))
+        # THE LOCK. Chief binds the iRacing id as soon as the SDK reports it, and
+        # the heartbeat starts carrying it from that moment. This is where a member
+        # who joined from the garage -- name only, no id -- becomes a real driver,
+        # and where their pre-built stints get their driver_custid backfilled.
+        if my_id is not None and _tr_claim_custid(st, tok.get("mid"), my_id):
+            tok["custid"] = my_id
+            st["version"] += 1
         # `version` is the STRUCTURAL version: roster, plan, stint history. Clients
         # rebuild their UI on it, and update_plan uses it as a compare-and-swap token.
         #
@@ -2938,7 +3064,7 @@ def tr_heartbeat(member_token, my_id, live=None, events=None):
             st["live_seq"] = int(st.get("live_seq", 0)) + 1
         for ev in (events or []):
             # Events mutate stint_history, which IS structural.
-            _tr_apply_event(st, ev.get("type"), tok["custid"], ev.get("data"))
+            _tr_apply_event(st, ev.get("type"), tok.get("custid"), ev.get("data"))
             structural = True
         if structural:
             st["version"] += 1
@@ -2960,13 +3086,35 @@ def tr_update_plan(member_token, plan, base_version):
         st, tok = _tr_resolve(member_token)
         if not st:
             return {"error": "unknown_token"}, 401
-        if st["room"]["host_custid"] != tok["custid"]:
+        # Host by MID, not custid. Checking custid meant a host who opened the room
+        # before loading into the sim (host_custid None) stopped being host of their
+        # own room the moment their real id arrived -- and could no longer edit the
+        # plan they had just built.
+        _host_mid = st["room"].get("host_mid")
+        _is_host = (tok.get("mid") == _host_mid) if _host_mid else \
+                   (st["room"].get("host_custid") == tok.get("custid"))
+        if not _is_host:
             return {"error": "host_only"}, 403
         if base_version is not None and int(base_version) != int(st["version"]):
             # Compare-and-swap miss: hand back the current state so the client
             # can rebase and retry rather than clobbering someone else's edit.
             return {"error": "version_conflict", "state": _tr_public(st)}, 409
         st["plan"] = plan or {}
+        # RESOLVE mid -> custid ON EVERY SAVE, not just at claim time.
+        # A plan built in the garage carries only member ids, and the engine matches
+        # stints on driver_custid. _tr_claim_custid backfills once when a driver
+        # connects -- but the host re-saving the plan afterwards ships the client's
+        # copy, whose stints still say null, and that wiped the resolution. Doing it
+        # here makes the plan self-healing whoever saves it and whenever.
+        _by_mid = {m.get("mid"): m for m in st["room"]["members"] if m.get("mid")}
+        for _s in (st["plan"].get("stints") or []):
+            _m = _by_mid.get(_s.get("mid"))
+            if _m is None:
+                continue
+            if _s.get("driver_custid") is None and _m.get("custid") is not None:
+                _s["driver_custid"] = _m["custid"]
+            if _m.get("name"):
+                _s["driver_name"] = _m["name"]     # a rename propagates
         st["plan"]["version"] = st["plan"].get("version", 1) + 1
         st["version"] += 1
         return {"state": _tr_public(st)}, 200
@@ -2977,7 +3125,9 @@ def tr_add_event(member_token, event):
         st, tok = _tr_resolve(member_token)
         if not st:
             return {"error": "unknown_token"}, 401
-        _tr_apply_event(st, (event or {}).get("type"), tok["custid"], (event or {}).get("data"))
+        _tr_touch(st, tok.get("mid"))
+        _tr_apply_event(st, (event or {}).get("type"), tok.get("custid"),
+                        (event or {}).get("data"))
         st["version"] += 1
         return {"ok": True, "seq": st["last_seq"]}, 200
 
@@ -2988,7 +3138,7 @@ def tr_leave(member_token):
         _TR_TOKENS.pop(member_token or "", None)
         if st and tok:
             for m in st["room"]["members"]:
-                if m["custid"] == tok["custid"]:
+                if m.get("mid") == tok.get("mid"):
                     m["online"] = False
         return {"ok": True}, 200
 
@@ -3000,6 +3150,7 @@ class TeamCreateIn(BaseModel):
     my_id: Optional[int] = None
     race_session_id: Optional[Any] = None
     install_id: Optional[str] = None
+    name: Optional[str] = None
 
 
 class TeamJoinIn(BaseModel):
@@ -3008,6 +3159,7 @@ class TeamJoinIn(BaseModel):
     my_id: Optional[int] = None
     room_code: str = ""
     install_id: Optional[str] = None
+    name: Optional[str] = None
 
 
 class TeamHeartbeatIn(BaseModel):
@@ -3041,13 +3193,15 @@ def _tr_reply(response: Response, pair):
 @app.post("/team/create")
 def team_create(body: TeamCreateIn, response: Response) -> Dict[str, Any]:
     return _tr_reply(response, tr_create_room(body.email, body.license_token, body.my_id,
-                                              body.race_session_id, body.install_id))
+                                              body.race_session_id, body.install_id,
+                                              name=body.name))
 
 
 @app.post("/team/join")
 def team_join(body: TeamJoinIn, response: Response) -> Dict[str, Any]:
     return _tr_reply(response, tr_join_room(body.email, body.license_token, body.my_id,
-                                            body.room_code, body.install_id))
+                                            body.room_code, body.install_id,
+                                            name=body.name))
 
 
 @app.post("/team/heartbeat")
