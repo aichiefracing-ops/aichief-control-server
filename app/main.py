@@ -3120,6 +3120,23 @@ def _tr_public(state: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in state.items() if not k.startswith("_")}
 
 
+def _tr_norm_id(v):
+    """A driver id only counts once iRacing is running. Before that the client
+    reports -1 (or 0/None), and that sentinel must NEVER be treated as a real
+    identity: the join reconnect matched seats on custid, so two teammates who
+    set up their room BEFORE firing up the sim both arrived as custid -1, matched
+    each other's seat, and the second one silently took over the first's seat
+    instead of being added (Kory + Amanda, Aug 22 -- confirmed from the live
+    roster: two -1 members can never share a room). Normalise any non-positive
+    id to None so all the existing None-handling (no seat match; custid locks on
+    later from the heartbeat) does the right thing."""
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
 def _tr_resolve(member_token):
     tok = _TR_TOKENS.get(member_token or "")
     if not tok:
@@ -3130,6 +3147,7 @@ def _tr_resolve(member_token):
 # --------------------------------------------------------------- store actions
 def tr_create_room(email, license_token, my_id, race_session_id=None, install_id=None,
                    name=None):
+    my_id = _tr_norm_id(my_id)
     if not verify_pro_plus(email, license_token, install_id):
         return {"error": "pro_plus_required"}, 403
     with _TR_LOCK:
@@ -3150,6 +3168,7 @@ def tr_create_room(email, license_token, my_id, race_session_id=None, install_id
 
 
 def tr_join_room(email, license_token, my_id, room_code, install_id=None, name=None):
+    my_id = _tr_norm_id(my_id)
     if not verify_pro_plus(email, license_token, install_id):
         return {"error": "pro_plus_required"}, 403
     with _TR_LOCK:
@@ -3218,6 +3237,7 @@ def tr_join_room(email, license_token, my_id, room_code, install_id=None, name=N
 
 
 def tr_heartbeat(member_token, my_id, live=None, events=None):
+    my_id = _tr_norm_id(my_id)
     with _TR_LOCK:
         st, tok = _tr_resolve(member_token)
         if not st:
