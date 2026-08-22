@@ -2698,6 +2698,14 @@ _TR_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # no O/0/I/1
 _TR_ROOM_TTL_S = float(os.getenv("TEAM_ROOM_TTL_S", str(8 * 3600)))
 _TR_EVENT_RING = 200
 _TR_HISTORY_MAX = 40
+# How many event ids to remember per room for duplicate suppression. A 24h race
+# is a few hundred events; this is comfortably more, and it is bounded so a room
+# cannot grow without limit.
+_TR_EID_MEMORY = int(os.getenv("TEAM_EID_MEMORY", "2000"))
+# A live block nobody has refreshed in this long is not live data any more. The
+# ACTIVE client pushes every 2s, so this only trips on a client that has actually
+# stopped -- crashed, alt-F4'd, or lost the internet mid-stint.
+_TR_LIVE_STALE_S = float(os.getenv("TEAM_LIVE_STALE_S", "15"))
 _TR_MAX_MEMBERS = int(os.getenv("TEAM_MAX_MEMBERS", "8"))
 TEAM_RELAY_ENFORCE = (os.getenv("TEAM_RELAY_ENFORCE", "0").strip() == "1")
 
@@ -2840,9 +2848,34 @@ def _tr_new_state(code: str, host_custid) -> Dict[str, Any]:
     }
 
 
-def _tr_apply_event(st: Dict[str, Any], ev_type, by_custid, data) -> None:
+def _tr_apply_event(st: Dict[str, Any], ev_type, by_custid, data, eid=None) -> bool:
     """Append to the event ring; mirror stint_complete into stint_history so a
-    late joiner sees completed stints even after they roll off the ring."""
+    late joiner sees completed stints even after they roll off the ring.
+
+    Returns True when the event was applied, False when it was a duplicate.
+
+    IDEMPOTENCY. The client drains its outbound queue BEFORE the POST and puts
+    the events back if the heartbeat fails -- and "failed" includes the case
+    where this server accepted the POST and the RESPONSE was lost on the way
+    back. The retry then delivers the same stint_complete a second time, and
+    stint_history is append-only with nothing identifying a row: two rows in the
+    debrief, an avg_burn averaged over the duplicate, and stops_remaining
+    (len(stints) - 1 - len(history)) a stop short for the rest of the race.
+
+    So every event the client sends carries an `eid` (uuid4). Remember the ones
+    we have applied and drop a repeat. Kept as a LIST, not a set, because the
+    room state is meant to be JSON-persistable (see the deployment note above),
+    and bounded because a 24h race is thousands of events.
+    """
+    if eid:
+        seen = st.setdefault("_eids", [])
+        if eid in seen:
+            print("[team] room %s: dropped duplicate %s (eid=%s)"
+                  % (st["room"]["code"], ev_type, eid))
+            return False
+        seen.append(eid)
+        if len(seen) > _TR_EID_MEMORY:
+            del seen[:-_TR_EID_MEMORY]
     st["last_seq"] += 1
     st["events"].append({"seq": st["last_seq"], "type": ev_type,
                          "by_custid": by_custid, "ts": _now(), "data": data or {}})
@@ -2852,6 +2885,7 @@ def _tr_apply_event(st: Dict[str, Any], ev_type, by_custid, data) -> None:
         st.setdefault("stint_history", []).append(dict(data or {}))
         if len(st["stint_history"]) > _TR_HISTORY_MAX:
             st["stint_history"] = st["stint_history"][-_TR_HISTORY_MAX:]
+    return True
 
 
 # ===================================================================
@@ -2941,6 +2975,39 @@ def _tr_touch(state: Dict[str, Any], mid) -> None:
             m["online"] = False
 
 
+def _tr_age_live(st: Dict[str, Any]) -> None:
+    """Mark the live block stale once nobody is refreshing it.
+
+    Nothing aged `live` out. The ACTIVE client writes it every 2s; if that client
+    crashes, alt-F4s or loses the internet, this server kept serving the LAST
+    payload it received, unchanged, for the rest of the race. Every pit wall in
+    the room showed IN CAR, that driver's fuel and that driver's tyres, with no
+    way to tell a steady stint from a dead connection.
+
+    Flagged, not blanked. The numbers are still the last thing that was true, and
+    a crew wants to see them -- they just need to know how old they are. Clients
+    render this as NO SIGNAL / LAST KNOWN.
+
+    Deliberately NOT a version bump: staleness is not a structural change, and
+    bumping here would churn every client's UI on a timer, which is the exact
+    problem the live/version split above exists to avoid.
+    """
+    lv = st.get("live")
+    if not isinstance(lv, dict) or not lv:
+        return
+    ts = lv.get("server_ts")
+    if ts is None:
+        return
+    try:
+        stale = (_now() - float(ts)) > _TR_LIVE_STALE_S
+    except (TypeError, ValueError):
+        return
+    if stale and not lv.get("stale"):
+        lv["stale"] = True
+        print("[team] room %s: live block went stale (%.0fs)"
+              % (st["room"]["code"], _now() - float(ts)))
+
+
 def _tr_public(state: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in state.items() if not k.startswith("_")}
 
@@ -2990,14 +3057,23 @@ def tr_join_room(email, license_token, my_id, room_code, install_id=None, name=N
         # come back at green; without this they would return as a SECOND member and
         # the stint plan would point at the seat they abandoned. Match the machine
         # first (install_id), then the iRacing id if we already have one.
+        #
+        # TWO PASSES, not one. Checking both keys inside a single loop makes the
+        # answer depend on member ORDER: a seat matching on custid at index 0
+        # wins over the seat matching on install_id at index 1, and the driver
+        # ends up with two seats. install_id is the stronger claim -- it is the
+        # machine -- so try it against everybody before falling back.
         seat = None
-        for m in members:
-            if install_id and m.get("install_id") and m["install_id"] == install_id:
-                seat = m
-                break
-            if my_id is not None and m.get("custid") == my_id:
-                seat = m
-                break
+        if install_id:
+            for m in members:
+                if m.get("install_id") and m["install_id"] == install_id:
+                    seat = m
+                    break
+        if seat is None and my_id is not None:
+            for m in members:
+                if m.get("custid") == my_id:
+                    seat = m
+                    break
 
         if seat is None:
             if len(members) >= _TR_MAX_MEMBERS:
@@ -3058,16 +3134,26 @@ def tr_heartbeat(member_token, my_id, live=None, events=None):
         # Live gets its own counter so a UI can still tell that the numbers moved.
         structural = False
         if isinstance(live, dict) and live:
+            # Stamp on the SERVER clock. The client's own session_t comes from the
+            # sim and stops moving with it, so it cannot answer "how long since
+            # anyone told me anything" -- which is the only question that matters
+            # when a client dies mid-stint. See _tr_age_live.
+            live["server_ts"] = _now()
+            live.pop("stale", None)
             st["live"] = live
             if live.get("active_custid") is not None:
                 st["live"]["active_custid"] = live["active_custid"]
             st["live_seq"] = int(st.get("live_seq", 0)) + 1
         for ev in (events or []):
-            # Events mutate stint_history, which IS structural.
-            _tr_apply_event(st, ev.get("type"), tok.get("custid"), ev.get("data"))
-            structural = True
+            # Events mutate stint_history, which IS structural -- but only if the
+            # event was actually applied. A re-delivered one changes nothing, and
+            # bumping version for it would churn every client's UI for no reason.
+            if _tr_apply_event(st, ev.get("type"), tok.get("custid"),
+                               ev.get("data"), eid=ev.get("eid")):
+                structural = True
         if structural:
             st["version"] += 1
+        _tr_age_live(st)
         return {"state": _tr_public(st)}, 200
 
 
@@ -3078,6 +3164,8 @@ def tr_get_state(room_code, member_token):
             st = _TR_ROOMS.get((room_code or "").upper())
         if not st:
             return {"error": "no_such_room"}, 404
+        # A late joiner's FIRST snapshot has to tell live data from a corpse too.
+        _tr_age_live(st)
         return _tr_public(st), 200
 
 
@@ -3126,9 +3214,10 @@ def tr_add_event(member_token, event):
         if not st:
             return {"error": "unknown_token"}, 401
         _tr_touch(st, tok.get("mid"))
-        _tr_apply_event(st, (event or {}).get("type"), tok.get("custid"),
-                        (event or {}).get("data"))
-        st["version"] += 1
+        if _tr_apply_event(st, (event or {}).get("type"), tok.get("custid"),
+                           (event or {}).get("data"),
+                           eid=(event or {}).get("eid")):
+            st["version"] += 1
         return {"ok": True, "seq": st["last_seq"]}, 200
 
 
