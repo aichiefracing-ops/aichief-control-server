@@ -2624,6 +2624,114 @@ def admin_recording_pin(
     return {"ok": True, "file": safe, "pinned": not unpin, "reason": None if unpin else reason}
 
 
+@app.get("/admin/storage")
+def admin_storage(
+    top: int = 15,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """What is ACTUALLY on the volume — walked from disk, not from the index.
+
+    /admin/recordings/storage answers "what does Postgres think we are keeping",
+    which is a different question and can be wildly optimistic. Two ways it
+    drifts, both of which have to be visible or they are unfixable:
+
+      * ORPHANS. A gzip that reached the volume without an index row is invisible
+        to plan_cleanup -- it reads `SELECT ... FROM prime_recordings` -- so it is
+        never counted toward the budget and can never be pruned. It just sits
+        there forever.
+      * THE REST OF DATA_DIR. Recordings share the volume with the append-only
+        logs (prime_sessions.jsonl, qa_findings.jsonl) and the JSON stores, and
+        NOTHING prunes those. A volume can fill with no recordings involved.
+
+    Read-only: this walks and reports. It never unlinks anything.
+    """
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+
+    indexed: set = set()
+    idx_ok = False
+    if _PG_URL:
+        try:
+            with _pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT file FROM prime_recordings")
+                    indexed = {r[0] for r in cur.fetchall() if r and r[0]}
+            idx_ok = True
+        except Exception as e:
+            print(f"[storage] index read failed: {e}")
+
+    out: Dict[str, Any] = {"ok": True, "data_dir": str(DATA_DIR),
+                           "index_readable": idx_ok, "budget_gb": STORAGE_BUDGET_GB}
+    buckets: Dict[str, Dict[str, Any]] = {}
+    biggest: List[Dict[str, Any]] = []
+    total = 0
+
+    def _bucket(rel: str) -> str:
+        if rel.startswith("recordings/") or rel.startswith("recordings\\"):
+            return "recordings"
+        if rel.endswith(".jsonl"):
+            return "append-only logs"
+        if rel.endswith(".json"):
+            return "json stores"
+        return "other"
+
+    try:
+        root = Path(DATA_DIR)
+        for p in root.rglob("*"):
+            try:
+                if not p.is_file():
+                    continue
+                sz = p.stat().st_size
+            except OSError:
+                continue
+            rel = str(p.relative_to(root))
+            total += sz
+            b = buckets.setdefault(_bucket(rel), {"bytes": 0, "files": 0})
+            b["bytes"] += sz
+            b["files"] += 1
+            biggest.append({"file": rel, "mb": round(sz / 1e6, 1)})
+    except Exception as e:
+        return {"ok": False, "detail": "walk failed: %s" % e}
+
+    # ORPHANS: on the volume, not in the index. These are the ones cleanup cannot
+    # see, so name them explicitly rather than burying them in a total.
+    orphans: List[Dict[str, Any]] = []
+    orphan_bytes = 0
+    if idx_ok:
+        try:
+            if RECORDINGS_DIR.exists():
+                for p in RECORDINGS_DIR.glob("*.jsonl.gz"):
+                    if p.name not in indexed:
+                        sz = p.stat().st_size
+                        orphan_bytes += sz
+                        orphans.append({"file": p.name, "mb": round(sz / 1e6, 1)})
+        except Exception as e:
+            print(f"[storage] orphan scan failed: {e}")
+
+    biggest.sort(key=lambda x: x["mb"], reverse=True)
+    orphans.sort(key=lambda x: x["mb"], reverse=True)
+    out["total_gb"] = round(total / 1e9, 3)
+    out["pct_of_budget"] = round(100.0 * total / max(0.001, STORAGE_BUDGET_GB * 1e9), 1)
+    out["by_kind"] = {k: {"gb": round(v["bytes"] / 1e9, 3), "files": v["files"]}
+                      for k, v in sorted(buckets.items(),
+                                         key=lambda kv: -kv[1]["bytes"])}
+    out["orphans"] = {
+        "count": len(orphans) if idx_ok else None,
+        "gb": round(orphan_bytes / 1e9, 3) if idx_ok else None,
+        "files": orphans[:max(0, top)],
+        # An unreadable index means we CANNOT tell an orphan from a tracked file.
+        # Reporting zero there would be a lie in the most useful direction.
+        "note": (("gzips on the volume with no index row — plan_cleanup cannot see "
+                  "or prune these") if idx_ok else
+                 "index unreadable — cannot tell orphans from tracked files"),
+    }
+    out["biggest"] = biggest[:max(0, top)]
+    return out
+
+
 @app.get("/admin/recordings/storage")
 def admin_recordings_storage(
     x_aichief_key: Optional[str] = Header(default=None),
