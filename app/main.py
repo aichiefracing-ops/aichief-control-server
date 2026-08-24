@@ -129,6 +129,11 @@ try:
                         CREATE INDEX IF NOT EXISTS qa_findings_created_idx ON prime_qa_findings(created_at DESC);
                         CREATE INDEX IF NOT EXISTS qa_findings_file_idx ON prime_qa_findings(recording_file);
                     """)
+                    # verdict: NULL/'real' = a genuine find (scores +3); 'false_positive'
+                    # = a find that turned out wrong (scores -1). Added late, so IF NOT EXISTS.
+                    cur.execute(
+                        "ALTER TABLE prime_qa_findings ADD COLUMN IF NOT EXISTS verdict TEXT"
+                    )
                 conn.commit()
             print("[qa] DB table ready")
         except Exception as e:
@@ -2059,7 +2064,7 @@ def qa_findings_feed(
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute(
                         "SELECT id, recording_file, uuid, build, track, car, worker, ticks, "
-                        "status, summary, report, created_at "
+                        "status, summary, report, verdict, created_at "
                         "FROM prime_qa_findings ORDER BY created_at DESC LIMIT 200"
                     )
                     for r in cur.fetchall():
@@ -2077,6 +2082,118 @@ def qa_findings_feed(
         except Exception:
             pass
     return {"ok": True, "count": len(rows), "findings": rows}
+
+
+# Lugnut leaderboard scoring — clean run +1, real bug found +3, false positive -1.
+QA_POINTS_CLEAN = int(os.getenv("QA_POINTS_CLEAN", "1"))
+QA_POINTS_FOUND = int(os.getenv("QA_POINTS_FOUND", "3"))
+QA_POINTS_FALSE = int(os.getenv("QA_POINTS_FALSE", "-1"))
+
+
+@app.get("/admin/qa/leaderboard.json")
+def qa_leaderboard(
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """All-time lugnut standings: points per worker. Clean run = 1, bug found = 3.
+    Aggregated over the WHOLE findings table (not the 200-row feed) so the board is
+    a real running total."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    agg: Dict[str, Dict[str, Any]] = {}
+
+    def _bump(worker: str, status: str, verdict: str, n: int, last_seen: str) -> None:
+        w = (worker or "").strip() or "lugnut"
+        st = (status or "").strip().lower()
+        vd = (verdict or "").strip().lower()
+        e = agg.setdefault(w, {"worker": w, "clean": 0, "found": 0, "false_pos": 0,
+                               "errors": 0, "runs": 0, "last_seen": ""})
+        if st == "clean":
+            e["clean"] += n
+        elif st == "found":
+            if vd == "false_positive":
+                e["false_pos"] += n
+            else:
+                e["found"] += n
+        else:
+            e["errors"] += n
+        e["runs"] += n
+        if last_seen and last_seen > (e["last_seen"] or ""):
+            e["last_seen"] = last_seen
+
+    if _PRIME_DB_OK:
+        try:
+            with _pg_conn() as conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(
+                        "SELECT COALESCE(NULLIF(TRIM(worker), ''), 'lugnut') AS worker, "
+                        "LOWER(status) AS st, LOWER(COALESCE(verdict, '')) AS vd, "
+                        "COUNT(*) AS n, MAX(created_at) AS last_seen "
+                        "FROM prime_qa_findings GROUP BY 1, 2, 3"
+                    )
+                    for r in cur.fetchall():
+                        _bump(r["worker"], r["st"], r["vd"], int(r["n"] or 0), str(r.get("last_seen") or ""))
+        except Exception as e:
+            print(f"[qa] leaderboard DB error: {e}")
+    elif QA_FINDINGS_INDEX.exists():
+        try:
+            for line in QA_FINDINGS_INDEX.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                d = json.loads(line)
+                _bump(d.get("worker", ""), d.get("status", ""), d.get("verdict", ""),
+                      1, str(d.get("created_at") or ""))
+        except Exception:
+            pass
+
+    board = []
+    for e in agg.values():
+        e["points"] = (e["clean"] * QA_POINTS_CLEAN
+                       + e["found"] * QA_POINTS_FOUND
+                       + e["false_pos"] * QA_POINTS_FALSE)
+        board.append(e)
+    board.sort(key=lambda x: (-x["points"], -x["found"], -x["runs"], x["worker"].lower()))
+    return {"ok": True,
+            "scoring": {"clean": QA_POINTS_CLEAN, "found": QA_POINTS_FOUND, "false_positive": QA_POINTS_FALSE},
+            "board": board}
+
+
+class QAVerdictIn(BaseModel):
+    id: int
+    verdict: str = ""   # "false_positive" | "real" | "" (clears back to untriaged)
+
+
+@app.post("/admin/qa/verdict")
+def qa_set_verdict(
+    body: QAVerdictIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """Triage a finding: mark a FOUND as a false positive (-1 on the board) or back to a
+    real bug. Set by finding id from the dashboard."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    vd = (body.verdict or "").strip().lower()
+    if vd not in ("false_positive", "real", ""):
+        return {"ok": False, "error": "verdict must be false_positive, real, or empty"}
+    val = vd or None
+    if not _PRIME_DB_OK:
+        return {"ok": False, "error": "no db"}
+    try:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE prime_qa_findings SET verdict = %s WHERE id = %s",
+                            (val, int(body.id)))
+            conn.commit()
+        print(f"[qa] verdict id={body.id} -> {val}")
+        return {"ok": True, "id": body.id, "verdict": val}
+    except Exception as e:
+        print(f"[qa] verdict error: {e}")
+        return {"ok": False, "error": str(e)}
 
 
 _QA_DASHBOARD_HTML = r'''<!doctype html>
@@ -2136,6 +2253,24 @@ _QA_DASHBOARD_HTML = r'''<!doctype html>
   label.tog{color:var(--dim);font-size:12.5px;display:flex;gap:5px;align-items:center;cursor:pointer}
   .keybox{padding:40px 16px;max-width:420px;margin:0 auto;text-align:center}
   .keybox input{width:100%;padding:11px;border-radius:9px;border:1px solid var(--line);background:var(--panel);color:var(--txt);font-size:15px;margin:12px 0}
+  .board{margin:6px 0 16px;background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:12px;overflow:hidden;display:none}
+  .board.show{display:block}
+  .board h2{margin:0;padding:11px 14px;font-size:13px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px;justify-content:space-between}
+  .board h2 .rule{color:var(--dim);font-size:11px;font-weight:400;text-transform:none;letter-spacing:0}
+  .lbrow{display:flex;align-items:center;gap:10px;padding:9px 14px;border-top:1px solid rgba(43,52,68,.5)}
+  .lbrow .rank{width:28px;text-align:center;font-weight:800;color:var(--dim);font-size:15px}
+  .lbrow.top1{background:linear-gradient(90deg,rgba(242,166,59,.13),transparent)}
+  .lbrow.top2{background:linear-gradient(90deg,rgba(155,167,180,.11),transparent)}
+  .lbrow.top3{background:linear-gradient(90deg,rgba(205,127,50,.12),transparent)}
+  .lbrow .who{font-weight:700;flex:1 1 auto;min-width:80px}
+  .lbrow .bd{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .lbrow .bd b.f{color:var(--found)} .lbrow .bd b.c{color:var(--clean)} .lbrow .bd b.fp{color:var(--err)}
+  .btn.danger{border-color:rgba(242,84,77,.5);color:var(--found)}
+  .badge.fpbadge{background:rgba(227,179,65,.15);color:var(--err)}
+  .card.fp{opacity:.62}
+  .card.fp .sum{text-decoration:line-through;opacity:.8}
+  .lbrow .pts{font-weight:850;font-size:18px;font-variant-numeric:tabular-nums;min-width:56px;text-align:right}
+  .lbrow .pts small{font-size:10px;color:var(--dim);font-weight:600}
 </style>
 </head>
 <body>
@@ -2154,6 +2289,7 @@ _QA_DASHBOARD_HTML = r'''<!doctype html>
     <input type="password" id="keyin" placeholder="CONTROL_API_KEY" autocomplete="off"/>
     <button class="btn" id="keygo">View dashboard</button>
   </div>
+  <div id="board" class="board"></div>
   <div id="list"></div>
 </div>
 <div class="toast" id="toast"></div>
@@ -2208,6 +2344,34 @@ function copyText(t){
 }
 function fallback(t){const ta=document.createElement("textarea");ta.value=t;document.body.appendChild(ta);ta.select();try{document.execCommand("copy");toast("Copied");}catch(e){toast("Copy failed");}ta.remove();}
 
+function medal(i){return i===0?"\u{1F947}":i===1?"\u{1F948}":i===2?"\u{1F949}":("#"+(i+1));}
+function renderBoard(board,scoring){
+  const el=$("#board");
+  if(!board||!board.length){el.classList.remove("show");el.innerHTML="";return;}
+  const fpv=(scoring&&scoring.false_positive!=null)?scoring.false_positive:-1;
+  const rule="clean +"+((scoring&&scoring.clean)||1)+" · bug +"+((scoring&&scoring.found)||3)+" · false pos "+fpv;
+  el.innerHTML='<h2><span>\u{1F3C1} Lugnut Leaderboard</span><span class="rule">'+rule+'</span></h2>'+
+    board.map((e,i)=>{
+      const cls=i<3?("top"+(i+1)):"";
+      const fp=(e.false_pos||0)>0?' · <b class="fp">'+e.false_pos+'</b> FP':'';
+      return '<div class="lbrow '+cls+'">'+
+        '<span class="rank">'+medal(i)+'</span>'+
+        '<span class="who">'+esc(e.worker)+'</span>'+
+        '<span class="bd"><b class="c">'+(e.clean||0)+'</b> clean · <b class="f">'+(e.found||0)+'</b> bug'+((e.found===1)?'':'s')+fp+' · '+(e.runs||0)+' runs</span>'+
+        '<span class="pts">'+(e.points||0)+' <small>PTS</small></span>'+
+      '</div>';
+    }).join("");
+  el.classList.add("show");
+}
+
+function loadBoard(){
+  if(!KEY)return;
+  fetch("/admin/qa/leaderboard.json",{headers:{"x-aichief-key":KEY}})
+    .then(r=>r.ok?r.json():null)
+    .then(d=>{if(d&&d.ok)renderBoard(d.board,d.scoring);})
+    .catch(()=>{});
+}
+
 function render(){
   const only=$("#onlyIssues").checked;
   const list=$("#list");
@@ -2229,21 +2393,36 @@ function render(){
       '<div class="item">caution@'+esc(d.caution_start_i)+': '+esc(d.from)+' &rarr; '+esc(d.to)+' at tick '+esc(d.at_i)+'</div>').join("");}
     if(f.error){details+='<div class="sec">Error</div><div class="item">'+esc(f.error)+'</div>';}
     if(!details){details='<div class="item ok">Clean — no invariant broke. says total '+esc(r.says_total||0)+', free-tier '+(r.free_tier_silent===false?'LEAK':'ok')+'.</div>';}
-    return '<div class="card '+st+'" data-i="'+idx+'">'+
+    const isFP=(f.verdict==="false_positive");
+    let vbtn="";
+    if(st==="found"){
+      vbtn = isFP
+        ? '<button class="btn small" onclick="markVerdict('+(f.id|0)+',\'real\')">&#10003; Real bug after all</button>'
+        : '<button class="btn small danger" onclick="markVerdict('+(f.id|0)+',\'false_positive\')">&#10007; False positive (&minus;1)</button>';
+    }
+    return '<div class="card '+st+(isFP?' fp':'')+'" data-i="'+idx+'">'+
       '<div class="row" onclick="this.parentNode.classList.toggle(\'open\')">'+
         '<span class="badge '+st+'">'+esc(st.toUpperCase())+'</span>'+
+        (isFP?'<span class="badge fpbadge">FALSE POS</span>':'')+
         '<span class="worker">'+esc(f.worker||"lugnut")+'</span>'+
         '<span class="meta grow">'+esc(f.car||"")+' @ '+esc(f.track||"")+' &middot; '+esc(f.ticks||0)+' ticks &middot; '+esc((f.created_at||"").replace("T"," ").slice(0,19))+'</span>'+
         '<span class="meta">'+esc(f.recording_file||"")+'</span>'+
         (f.summary?'<div class="sum '+st+'">'+esc(f.summary)+'</div>':'')+
       '</div>'+
       '<div class="body">'+details+
-        '<div class="actions"><button class="btn small" onclick="copyOne('+idx+')">&#128203; Copy for Claude</button></div>'+
+        '<div class="actions"><button class="btn small" onclick="copyOne('+idx+')">&#128203; Copy for Claude</button>'+vbtn+'</div>'+
       '</div></div>';
   }).join("");
 }
 
 window.copyOne=function(i){const f=DATA.filter(f=>!$("#onlyIssues").checked||f.status==="found"||f.status==="error")[i];if(f)copyText(claudeBlock(f));};
+
+window.markVerdict=function(id,verdict){
+  fetch("/admin/qa/verdict",{method:"POST",headers:{"content-type":"application/json","x-aichief-key":KEY},body:JSON.stringify({id:id,verdict:verdict})})
+    .then(r=>r.json())
+    .then(d=>{if(d&&d.ok){toast(verdict==="false_positive"?"Marked false positive (−1)":"Marked real bug");load();}else{toast((d&&d.error)||"Failed");}})
+    .catch(()=>toast("Failed"));
+};
 
 function copyAll(){
   const issues=DATA.filter(f=>f.status==="found"||f.status==="error");
@@ -2254,6 +2433,7 @@ function copyAll(){
 function load(){
   if(!KEY){$("#keybox").style.display="block";$("#status").textContent="locked";return;}
   $("#status").textContent="loading…";
+  loadBoard();
   fetch("/admin/qa/findings.json",{headers:{"x-aichief-key":KEY}})
     .then(r=>{if(r.status===401){throw new Error("bad key");}return r.json();})
     .then(d=>{DATA=d.findings||[];$("#keybox").style.display="none";
