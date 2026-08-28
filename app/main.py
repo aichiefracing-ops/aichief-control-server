@@ -728,6 +728,8 @@ class AdminSettings(BaseModel):
     garage_status: str = ""
     garage_note: str = ""
     garage_subnote: str = ""
+    pro_plus_available: bool = False   # Pro+ launch lever -> /client/config
+    upgrade_url: str = ""              # config-driven upgrade page (no client rebuild)
 
 class KillIn(BaseModel):
     version: str
@@ -809,6 +811,12 @@ def client_config(body: ClientConfigIn) -> Dict[str, Any]:
     garage_status = str(settings.get("garage_status", ""))
     garage_note = str(settings.get("garage_note", ""))
     garage_subnote = str(settings.get("garage_subnote", ""))
+    # Pro+ launch lever: dormant Pro+ code ships in the client; flip this from the
+    # admin dashboard to reveal the "UPGRADE CHIEF" button to PRO users (free always
+    # sees it, Pro+ never). upgrade_url lets the button re-point at the new Pro+
+    # marketing page without a client rebuild.
+    pro_plus_available = bool(settings.get("pro_plus_available", False))
+    upgrade_url = str(settings.get("upgrade_url", ""))
 
     kill_list = settings.get("kill_list", [])
     safe_kill_list = [str(k).strip() for k in kill_list]
@@ -839,6 +847,8 @@ def client_config(body: ClientConfigIn) -> Dict[str, Any]:
         "garage_status": garage_status,
         "garage_note": garage_note,
         "garage_subnote": garage_subnote,
+        "pro_plus_available": pro_plus_available,
+        "upgrade_url": upgrade_url,
     }
 
 
