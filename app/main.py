@@ -2122,6 +2122,12 @@ def _affiliate_stripe_sync(dry_run: bool = True) -> Dict[str, Any]:
         actions: List[Dict[str, Any]] = []
         needs_link: List[Dict[str, Any]] = []
         waiting: List[Dict[str, Any]] = []
+        by_code: Dict[str, List[Dict[str, Any]]] = {}   # what Stripe has per affiliate code (2026-10-17)
+
+        def _seen(code_, email_, tier_, st, end_, linked_to, cape):
+            by_code.setdefault(code_, []).append({
+                "email": email_, "tier": tier_, "stripe_status": st, "ended": end_ or "",
+                "cancel_at_period_end": bool(cape), "linked_to": linked_to or ""})
         for ss in _stripe_all_subs():
             sid = ss.get("id") or ""
             tier = _stripe_tier(ss)
@@ -2134,9 +2140,11 @@ def _affiliate_stripe_sync(dry_run: bool = True) -> Dict[str, Any]:
             end_date = _ts_date(ss.get("ended_at") or ss.get("canceled_at")) if ended else ""
             monthly = tier.endswith("_monthly")
 
+            cape = bool(ss.get("cancel_at_period_end"))
             if sid in by_stripe:
                 code, ls = by_stripe[sid]
                 p = profiles[code]
+                _seen(code, email, tier, st_, end_date, ls.get("sub_name"), cape)
                 if ended and ls.get("status") == "active":
                     paid = _paid_invoices(_stripe_sub_invoices(sid))
                     act = {"action": "cancel", "code": code, "sub": ls.get("sub_name"), "email": email,
@@ -2184,6 +2192,7 @@ def _affiliate_stripe_sync(dry_run: bool = True) -> Dict[str, Any]:
                 legacy = next((x for x in p.get("subs", []) if not x.get("stripe_sub_id") and (
                     (x.get("email") or "").strip().lower() == email
                     or (x.get("sub_name") or "").strip().lower() == email)), None)
+            _seen(code, email, tier, st_, end_date, legacy.get("sub_name") if legacy is not None else "", cape)
             if legacy is not None:
                 act = {"action": "link", "code": code, "sub": legacy.get("sub_name"), "email": email,
                        "tier": tier, "stripe_sub_id": sid}
@@ -2216,11 +2225,13 @@ def _affiliate_stripe_sync(dry_run: bool = True) -> Dict[str, Any]:
                    "needs_link": len(needs_link), "waiting_trial": len(waiting)}
         if not dry_run:
             _save_profiles(profiles)
-            state.update({"auto_from": auto_from, "last_run": summary, "needs_link": needs_link,
-                          "waiting_trial": waiting})
-            _save_json(AFFILIATE_SYNC_STATE_PATH, state)
+            state.update({"auto_from": auto_from, "last_run": summary})
+        # needs_link is a worklist, not a ledger change: save it on Preview too so items can be
+        # linked straight from the preview (2026-10-17). Ledger only changes on Apply.
+        state.update({"needs_link": needs_link, "waiting_trial": waiting, "stripe_by_code": by_code})
+        _save_json(AFFILIATE_SYNC_STATE_PATH, state)
         return {"ok": True, **summary, "actions": actions, "needs_link_items": needs_link,
-                "waiting_trial_items": waiting}
+                "waiting_trial_items": waiting, "stripe_by_code": by_code}
     finally:
         if lock is not None:
             lock.release()
@@ -2261,6 +2272,7 @@ def admin_affiliate_stripe_sync_status(
     st_ = _load_json(AFFILIATE_SYNC_STATE_PATH, {})
     return {"ok": True, "auto_from": st_.get("auto_from"), "last_run": st_.get("last_run"),
             "needs_link": st_.get("needs_link") or [], "waiting_trial": st_.get("waiting_trial") or [],
+            "stripe_by_code": st_.get("stripe_by_code") or {},
             "autosync": os.getenv("AFFILIATE_AUTOSYNC", "1") == "1" and bool(STRIPE_SECRET_KEY)}
 
 
