@@ -689,7 +689,8 @@ def _compute_balance(profile: dict) -> float:
     total = 0.0
     for entry in profile.get("log", []):
         etype = entry.get("type", "")
-        if etype in ("new_sub_yearly", "recurring", "payout", "sub_removed"):
+        if etype in ("new_sub_yearly", "recurring", "payout", "sub_removed",
+                     "cancel_adjust", "refund_reversal"):
             total += entry.get("amount", 0.0)
     return round(total, 2)
 
@@ -792,11 +793,13 @@ def _sub_credit_total(profile: dict, sub: dict) -> float:
     tag = f"{name} ({tier}) +${rate:.2f}" if rate is not None else None
     for e in _ledger_since_removal(profile, name, tier):
         t = e.get("type")
-        if t == "new_sub_yearly":
+        if t in ("new_sub_yearly", "refund_reversal"):
             if (e.get("sub_name") or "").strip() == name and (e.get("tier") or "").lower() == tier:
-                total += float(e.get("amount", 0.0) or 0.0)
+                total += float(e.get("amount", 0.0) or 0.0)      # refund_reversal is negative
         elif t == "recurring" and tag:
             total += rate * sum(1 for b in (e.get("breakdown") or []) if b == tag)
+        elif t == "cancel_adjust" and tag and e.get("tag") == tag:
+            total += float(e.get("amount", 0.0) or 0.0)          # already reversed (negative)
     dupes = sum(1 for s in profile.get("subs", [])
                 if (s.get("sub_name") or "").strip() == name and (s.get("tier") or "").strip().lower() == tier)
     return round(total / max(dupes, 1), 2)
@@ -822,6 +825,108 @@ def _remove_sub(profile: dict, sub_id: str, note: str) -> Dict[str, Any]:
         "note": note or "removed by admin",
     })
     return {"sub": sub, "reversed": credit}
+
+
+def _sub_tag(sub: dict) -> Optional[str]:
+    tier = (sub.get("tier") or "").strip().lower()
+    rate = TIER_MONTHLY_RATE.get(tier)
+    if rate is None:
+        return None
+    return f"{(sub.get('sub_name') or '').strip()} ({tier}) +${rate:.2f}"
+
+
+def _net_credit_months(profile: dict, sub: dict) -> Dict[str, int]:
+    """month -> net monthly credits on the ledger for this sub's tag (recurring lines
+    minus cancel_adjust reversals), since its last removal."""
+    from collections import Counter
+    tag = _sub_tag(sub)
+    if not tag:
+        return {}
+    name = (sub.get("sub_name") or "").strip()
+    tier = (sub.get("tier") or "").strip().lower()
+    net: Counter = Counter()
+    for e in _ledger_since_removal(profile, name, tier):
+        if e.get("type") == "recurring":
+            net[e.get("month", "")] += sum(1 for b in (e.get("breakdown") or []) if b == tag)
+        elif e.get("type") == "cancel_adjust" and e.get("tag") == tag:
+            for mth in e.get("months") or []:
+                net[mth] -= 1
+    return {k: v for k, v in net.items() if v > 0}
+
+
+def _reverse_after_cancel(profile: dict, sub: dict, cancel_date: str, note: str,
+                          paid_months: Optional[int] = None) -> float:
+    """Commission stops after the customer's last paid month (Kory 2026-10-17).
+    paid_months (from Stripe: count of paid invoices) -> keep the earliest N credited
+    months and reverse the rest. Without it (manual cancel) keep months up to and
+    including the cancel month. Books one cancel_adjust line; history untouched."""
+    tag = _sub_tag(sub)
+    if not tag:
+        return 0.0
+    name = (sub.get("sub_name") or "").strip()
+    tier = (sub.get("tier") or "").strip().lower()
+    twins = [x for x in profile.get("subs", []) if x is not sub and _sub_tag(x) == tag]
+    if twins:
+        _append_log(profile, {"type": "status_change", "sub_name": name, "tier": tier, "amount": 0.0,
+                              "date": cancel_date, "note": "cancel: same name+tier twin on this code - "
+                              "check credits by hand (no auto reversal)"})
+        return 0.0
+    net = _net_credit_months(profile, sub)
+    months = sorted(m for m, n in net.items() for _ in range(n))
+    if paid_months is not None:
+        drop = months[max(int(paid_months), 0):]
+    else:
+        cm = (cancel_date or "")[:7]
+        drop = [m for m in months if cm and m > cm]
+    if not drop:
+        return 0.0
+    rate = TIER_MONTHLY_RATE[tier]
+    amt = round(rate * len(drop), 2)
+    _append_log(profile, {"type": "cancel_adjust", "sub_id": sub.get("sub_id"), "sub_name": name,
+                          "tier": tier, "tag": tag, "months": drop, "amount": -amt,
+                          "date": cancel_date, "note": note})
+    return amt
+
+
+def _cancel_sub(profile: dict, sub: dict, cancel_date: str, note: str,
+                paid_months: Optional[int] = None) -> float:
+    old = sub.get("status")
+    sub["status"] = "cancelled"
+    sub["cancelled_date"] = cancel_date
+    if old != "cancelled":
+        _append_log(profile, {"type": "status_change", "sub_name": sub.get("sub_name", ""),
+                              "tier": sub.get("tier", ""), "old_status": old, "new_status": "cancelled",
+                              "date": cancel_date, "amount": 0.0, "note": note})
+    return _reverse_after_cancel(profile, sub, cancel_date, note, paid_months)
+
+
+def _credit_month(profile: dict, month: str) -> Dict[str, Any]:
+    """Credit `month` for every ACTIVE monthly sub that doesn't have it yet. Per sub, not
+    per affiliate: the old check skipped the whole affiliate for the month if any
+    recurring line existed - a sub added mid-month (its backfill line) left everyone
+    else on that code unpaid (2026-10-17)."""
+    need: Dict[str, int] = {}
+    rates: Dict[str, float] = {}
+    for sub in profile.get("subs", []):
+        if (sub.get("status") or "") != "active":
+            continue
+        tag = _sub_tag(sub)
+        if not tag or (sub.get("start_date") or "")[:7] > month:
+            continue
+        need[tag] = need.get(tag, 0) + 1
+        rates[tag] = TIER_MONTHLY_RATE[(sub.get("tier") or "").strip().lower()]
+    breakdown: List[str] = []
+    total = 0.0
+    for tag, n in need.items():
+        rep_sub = next(x for x in profile.get("subs", []) if _sub_tag(x) == tag)
+        have = _net_credit_months(profile, rep_sub).get(month, 0)
+        for _ in range(max(n - have, 0)):
+            breakdown.append(tag)
+            total += rates[tag]
+    if breakdown:
+        _append_log(profile, {"type": "recurring", "month": month, "amount": round(total, 2),
+                              "breakdown": breakdown, "date": f"{month}-01"})
+    return {"earned": round(total, 2), "breakdown": breakdown}
 
 # -------------------------
 # Models
@@ -1757,6 +1862,9 @@ def admin_affiliate_sub_add(
                         "date": body.cancelled_date or body.start_date,
                         "amount": 0.0,
                     })
+                    if status == "cancelled":
+                        # stop commission after the last paid month (2026-10-17)
+                        _reverse_after_cancel(profile, s, s.get("cancelled_date") or "", "manual cancel")
                 break
     else:
         _add_new_sub(profile, subs, body.sub_name, tier, body.start_date, status,
@@ -1903,6 +2011,327 @@ def admin_affiliate_unassigned_dismiss(
     return {"ok": True, "code": code, "dismissed": em}
 
 
+# ═══════════════════════════════════════════════════════════════
+# Affiliate <- Stripe auto-sync (2026-10-17)
+#   - paid signups since auto_from are added to the code they used (trials wait
+#     until the first real payment)
+#   - cancels: sub -> cancelled, commission stops after the last paid month
+#   - yearly: a Stripe REFUND reverses the upfront; a plain cancel keeps it
+#   - subs entered by hand before auto_from: matched by email when possible,
+#     otherwise listed in needs_link for a one-time link (never double-added)
+# ═══════════════════════════════════════════════════════════════
+AFFILIATE_SYNC_STATE_PATH = DATA_DIR / "affiliate_sync_state.json"
+import threading as _aff_sync_threading
+_AFF_SYNC_LOCK = _aff_sync_threading.Lock()
+_STRIPE_ENDED = ("canceled", "unpaid", "incomplete_expired")
+
+
+def _ts_date(ts) -> str:
+    from datetime import datetime as _dt, timezone as _tz
+    try:
+        return _dt.fromtimestamp(float(ts), _tz.utc).date().isoformat()
+    except Exception:
+        return ""
+
+
+def _stripe_get(path: str, params: list) -> dict:
+    r = requests.get(f"https://api.stripe.com/v1/{path}", params=params,
+                     auth=(STRIPE_SECRET_KEY, ""), timeout=20)
+    if not r.ok:
+        raise RuntimeError(f"Stripe {path} {r.status_code}: {r.text[:200]}")
+    return r.json()
+
+
+def _stripe_all_subs() -> list:
+    out, after = [], None
+    while True:
+        params = [("status", "all"), ("limit", "100"), ("expand[]", "data.customer"),
+                  ("expand[]", "data.discount.promotion_code")]
+        if after:
+            params.append(("starting_after", after))
+        d = _stripe_get("subscriptions", params)
+        data = d.get("data") or []
+        out.extend(data)
+        if not d.get("has_more") or not data:
+            return out
+        after = data[-1].get("id")
+
+
+def _stripe_sub_invoices(sub_id: str) -> list:
+    d = _stripe_get("invoices", [("subscription", sub_id), ("limit", "100")])
+    return sorted(d.get("data") or [], key=lambda i: i.get("created") or 0)
+
+
+def _stripe_customer_refunded(customer_id: str, since_ts: float) -> bool:
+    if not customer_id:
+        return False
+    d = _stripe_get("charges", [("customer", customer_id), ("limit", "100")])
+    for ch in d.get("data") or []:
+        if (ch.get("created") or 0) >= since_ts and ch.get("amount_refunded", 0) and \
+                ch.get("amount_refunded", 0) >= ch.get("amount", 0) > 0:
+            return True
+    return False
+
+
+def _stripe_tier(ss: dict) -> Optional[str]:
+    try:
+        price = ((ss.get("items") or {}).get("data") or [{}])[0].get("price") or {}
+    except Exception:
+        return None
+    prod = price.get("product")
+    prod = prod.get("id") if isinstance(prod, dict) else prod
+    pid = price.get("id")
+    if prod in STRIPE_PRO_PLUS_IDS or pid in STRIPE_PRO_PLUS_IDS:
+        base = "pro_plus"
+    elif prod in STRIPE_PRO_IDS or pid in STRIPE_PRO_IDS:
+        base = "pro"
+    else:
+        return None
+    interval = ((price.get("recurring") or {}).get("interval") or "month").lower()
+    return f"{base}_{'yearly' if interval == 'year' else 'monthly'}"
+
+
+def _paid_invoices(invoices: list) -> list:
+    return [i for i in invoices if i.get("status") == "paid" and (i.get("amount_paid") or 0) > 0]
+
+
+def _affiliate_stripe_sync(dry_run: bool = True) -> Dict[str, Any]:
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=400, detail="STRIPE_SECRET_KEY not set on the server")
+    from datetime import date as _date
+    lock = _AFF_SYNC_LOCK
+    if lock is not None and not lock.acquire(timeout=120):
+        raise HTTPException(status_code=409, detail="a sync is already running")
+    try:
+        state = _load_json(AFFILIATE_SYNC_STATE_PATH, {})
+        auto_from = (os.getenv("AFFILIATE_AUTO_FROM") or state.get("auto_from") or _date.today().isoformat())
+        ignored = set(state.get("ignored") or [])
+        profiles = _load_profiles()
+        by_stripe: Dict[str, Any] = {}
+        for code, p in profiles.items():
+            for x in p.get("subs", []):
+                if x.get("stripe_sub_id"):
+                    by_stripe[x["stripe_sub_id"]] = (code, x)
+        detected = _load_json(AFFILIATES_PATH, {})
+        email_code = {}
+        for c, info in detected.items():
+            for d in info.get("subs", []):
+                if d.get("email"):
+                    email_code[d["email"].strip().lower()] = (c or "").strip().upper()
+
+        actions: List[Dict[str, Any]] = []
+        needs_link: List[Dict[str, Any]] = []
+        waiting: List[Dict[str, Any]] = []
+        for ss in _stripe_all_subs():
+            sid = ss.get("id") or ""
+            tier = _stripe_tier(ss)
+            if not tier or sid in ignored:
+                continue
+            cust = ss.get("customer") if isinstance(ss.get("customer"), dict) else {}
+            email = (cust.get("email") or "").strip().lower()
+            st_ = ss.get("status") or ""
+            ended = st_ in _STRIPE_ENDED
+            end_date = _ts_date(ss.get("ended_at") or ss.get("canceled_at")) if ended else ""
+            monthly = tier.endswith("_monthly")
+
+            if sid in by_stripe:
+                code, ls = by_stripe[sid]
+                p = profiles[code]
+                if ended and ls.get("status") == "active":
+                    paid = _paid_invoices(_stripe_sub_invoices(sid))
+                    act = {"action": "cancel", "code": code, "sub": ls.get("sub_name"), "email": email,
+                           "tier": ls.get("tier"), "date": end_date, "paid_invoices": len(paid)}
+                    if not dry_run:
+                        act["reversed"] = _cancel_sub(p, ls, end_date, f"stripe: {st_}",
+                                                      paid_months=len(paid) if monthly else None)
+                    actions.append(act)
+                if ended and not monthly and not ls.get("refund_reversed"):
+                    since = float(ss.get("start_date") or 0)
+                    if _stripe_customer_refunded(cust.get("id") or "", since):
+                        amt = TIER_YEARLY_RATE.get((ls.get("tier") or "").lower(), 0.0)
+                        actions.append({"action": "refund_reverse", "code": code, "sub": ls.get("sub_name"),
+                                        "email": email, "amount": -amt})
+                        if not dry_run and amt:
+                            ls["refund_reversed"] = True
+                            _append_log(p, {"type": "refund_reversal", "sub_id": ls.get("sub_id"),
+                                            "sub_name": ls.get("sub_name", ""), "tier": ls.get("tier", ""),
+                                            "amount": -amt, "date": end_date or _date.today().isoformat(),
+                                            "note": "Stripe refund - yearly upfront reversed"})
+                continue
+
+            if st_ in ("incomplete",):
+                continue
+            invoices = _stripe_sub_invoices(sid)
+            paid = _paid_invoices(invoices)
+            if not paid:
+                if st_ == "trialing":
+                    waiting.append({"email": email, "tier": tier, "stripe_sub_id": sid,
+                                    "trial_end": _ts_date(ss.get("trial_end"))})
+                continue
+            code = _extract_promo_code(ss, cust)
+            if not code and invoices:
+                code = _extract_promo_code_from_invoice(invoices[0].get("id") or "")
+            if not code:
+                code = email_code.get(email)
+            code = (code or "").strip().upper()
+            if code not in profiles:
+                continue
+            p = profiles[code]
+            first_paid = _ts_date((paid[0].get("status_transitions") or {}).get("paid_at")
+                                  or paid[0].get("created"))
+            legacy = None
+            if email:
+                legacy = next((x for x in p.get("subs", []) if not x.get("stripe_sub_id") and (
+                    (x.get("email") or "").strip().lower() == email
+                    or (x.get("sub_name") or "").strip().lower() == email)), None)
+            if legacy is not None:
+                act = {"action": "link", "code": code, "sub": legacy.get("sub_name"), "email": email,
+                       "tier": tier, "stripe_sub_id": sid}
+                if (legacy.get("tier") or "").lower() != tier:
+                    act["note"] = f"ledger tier {legacy.get('tier')} != Stripe {tier} (left as is)"
+                actions.append(act)
+                if not dry_run:
+                    legacy["stripe_sub_id"], legacy["email"] = sid, email
+                    if ended and legacy.get("status") == "active":
+                        _cancel_sub(p, legacy, end_date, f"stripe: {st_}",
+                                    paid_months=len(paid) if monthly else None)
+                continue
+            rec = {"code": code, "email": email, "tier": tier, "stripe_sub_id": sid,
+                   "first_paid": first_paid, "paid_invoices": len(paid), "ended": ended, "end_date": end_date}
+            if first_paid >= auto_from:
+                actions.append(dict(rec, action="add"))
+                if not dry_run:
+                    subs = p.setdefault("subs", [])
+                    new_id = _add_new_sub(p, subs, email, tier, first_paid, "active", None, email=email)
+                    new = next(x for x in subs if x.get("sub_id") == new_id)
+                    new["stripe_sub_id"] = sid
+                    if ended:
+                        _cancel_sub(p, new, end_date, f"stripe: {st_}", paid_months=len(paid) if monthly else None)
+            else:
+                needs_link.append(rec)
+
+        summary = {"ran_at": _now(), "dry_run": dry_run, "auto_from": auto_from,
+                   "counts": {k: sum(1 for a in actions if a["action"] == k)
+                              for k in ("add", "cancel", "link", "refund_reverse")},
+                   "needs_link": len(needs_link), "waiting_trial": len(waiting)}
+        if not dry_run:
+            _save_profiles(profiles)
+            state.update({"auto_from": auto_from, "last_run": summary, "needs_link": needs_link,
+                          "waiting_trial": waiting})
+            _save_json(AFFILIATE_SYNC_STATE_PATH, state)
+        return {"ok": True, **summary, "actions": actions, "needs_link_items": needs_link,
+                "waiting_trial_items": waiting}
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+class AffiliateSyncIn(BaseModel):
+    dry_run: bool = True
+
+
+class AffiliateStripeLinkIn(BaseModel):
+    stripe_sub_id: str
+    link_to_sub_id: Optional[str] = None   # existing ledger sub (e.g. a gamertag); None -> add new
+    ignore: bool = False                    # never sync this Stripe sub (tester, comp, etc.)
+
+
+@app.post("/admin/affiliate/stripe-sync")
+def admin_affiliate_stripe_sync(
+    body: AffiliateSyncIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    return _affiliate_stripe_sync(dry_run=bool(body.dry_run))
+
+
+@app.get("/admin/affiliate/stripe-sync/status")
+def admin_affiliate_stripe_sync_status(
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    st_ = _load_json(AFFILIATE_SYNC_STATE_PATH, {})
+    return {"ok": True, "auto_from": st_.get("auto_from"), "last_run": st_.get("last_run"),
+            "needs_link": st_.get("needs_link") or [], "waiting_trial": st_.get("waiting_trial") or [],
+            "autosync": os.getenv("AFFILIATE_AUTOSYNC", "1") == "1" and bool(STRIPE_SECRET_KEY)}
+
+
+@app.post("/admin/affiliate/stripe-link")
+def admin_affiliate_stripe_link(
+    body: AffiliateStripeLinkIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    """Resolve a needs_link item from the last sync: link it to an existing ledger sub,
+    add it as a new sub, or ignore it for good."""
+    state = _load_json(AFFILIATE_SYNC_STATE_PATH, {})
+    items = state.get("needs_link") or []
+    rec = next((r for r in items if r.get("stripe_sub_id") == body.stripe_sub_id), None)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="not in the needs-link list (run a sync first)")
+    if body.ignore:
+        state.setdefault("ignored", []).append(body.stripe_sub_id)
+    else:
+        profiles = _load_profiles()
+        p = profiles.get(rec["code"])
+        if p is None:
+            raise HTTPException(status_code=404, detail=f"Affiliate {rec['code']} not found")
+        monthly = rec["tier"].endswith("_monthly")
+        if body.link_to_sub_id:
+            x = next((x for x in p.get("subs", []) if x.get("sub_id") == body.link_to_sub_id), None)
+            if x is None:
+                raise HTTPException(status_code=404, detail="ledger sub not found on that code")
+            x["stripe_sub_id"], x["email"] = rec["stripe_sub_id"], rec["email"]
+        else:
+            subs = p.setdefault("subs", [])
+            nid = _add_new_sub(p, subs, rec["email"], rec["tier"], rec["first_paid"], "active", None,
+                               email=rec["email"])
+            x = next(s for s in subs if s.get("sub_id") == nid)
+            x["stripe_sub_id"] = rec["stripe_sub_id"]
+        if rec.get("ended") and x.get("status") == "active":
+            _cancel_sub(p, x, rec.get("end_date") or "", "stripe: ended",
+                        paid_months=rec.get("paid_invoices") if monthly else None)
+        _save_profiles(profiles)
+    state["needs_link"] = [r for r in items if r.get("stripe_sub_id") != body.stripe_sub_id]
+    _save_json(AFFILIATE_SYNC_STATE_PATH, state)
+    return {"ok": True, "resolved": body.stripe_sub_id, "left": len(state["needs_link"])}
+
+
+def _affiliate_daily_loop():
+    from datetime import date as _date
+    time.sleep(float(os.getenv("AFFILIATE_AUTOSYNC_DELAY_S", "600")))
+    while True:
+        try:
+            if STRIPE_SECRET_KEY:
+                r = _affiliate_stripe_sync(dry_run=False)
+                print(f"[affiliate] daily sync: {r.get('counts')} needs_link={r.get('needs_link')}")
+            month = _date.today().strftime("%Y-%m")
+            profiles = _load_profiles()
+            got = {c: _credit_month(p, month)["earned"] for c, p in profiles.items()}
+            _save_profiles(profiles)
+            print(f"[affiliate] daily credit {month}: {got}")
+        except Exception as e:
+            print(f"[affiliate] daily job failed: {e}")
+        time.sleep(float(os.getenv("AFFILIATE_AUTOSYNC_EVERY_S", "86400")))
+
+
+if os.getenv("AFFILIATE_AUTOSYNC", "1") == "1":
+    import threading as _aff_threading
+    _aff_threading.Thread(target=_affiliate_daily_loop, daemon=True, name="affiliate-daily").start()
+
+
 @app.post("/admin/affiliate/payouts")
 def admin_affiliate_payout(
     body: AffiliatePayoutIn,
@@ -1953,45 +2382,13 @@ def admin_affiliate_generate_recurring(
 
     profiles = _load_profiles()
     results = []
-
     for code, profile in profiles.items():
-        # Check if already generated for this month
-        already_run = any(
-            e.get("type") == "recurring" and e.get("month") == month
-            for e in profile.get("log", [])
-        )
-        if already_run:
-            results.append({"code": code, "skipped": True, "reason": "already generated"})
-            continue
-
-        total_earned = 0.0
-        breakdown = []
-        for sub in profile.get("subs", []):
-            if sub.get("status") != "active":
-                continue
-            tier = sub.get("tier", "")
-            if tier not in TIER_MONTHLY_RATE:
-                continue
-            # Only count subs that started on or before this month
-            start = sub.get("start_date", "")
-            if start[:7] > month:
-                continue
-            rate = TIER_MONTHLY_RATE[tier]
-            total_earned += rate
-            breakdown.append(f"{sub.get('sub_name', '?')} ({tier}) +${rate:.2f}")
-
-        if total_earned > 0:
-            _append_log(profile, {
-                "type": "recurring",
-                "month": month,
-                "amount": total_earned,
-                "breakdown": breakdown,
-                "date": f"{month}-01",
-            })
-            results.append({"code": code, "earned": total_earned, "breakdown": breakdown})
+        r = _credit_month(profile, month)
+        if r["earned"] > 0:
+            results.append({"code": code, "earned": r["earned"], "breakdown": r["breakdown"]})
         else:
-            results.append({"code": code, "earned": 0.0, "note": "no active monthly subs"})
-
+            results.append({"code": code, "earned": 0.0, "skipped": True,
+                            "reason": "every active monthly sub already credited (or none)"})
     _save_profiles(profiles)
     return {"ok": True, "month": month, "results": results}
 
