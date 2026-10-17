@@ -731,10 +731,13 @@ def _add_new_sub(profile: dict, subs: list, sub_name: str, tier: str, start_date
                 month_str = f"{y:04d}-{m:02d}"
                 # Don't double-fire for this specific sub+month combo
                 sub_label = body_sub_name.strip()
+                # exact name+PLAN tag (2026-10-17): name-only matching let a Pro line for
+                # "up@x.com" block the Pro+ backfill for the same customer after an upgrade
+                _tag = f"{sub_label} ({tier}) +${rate:.2f}"
                 already = any(
                     e.get("type") == "recurring"
                     and e.get("month") == month_str
-                    and sub_label in (e.get("breakdown") or [""])[0]
+                    and _tag in (e.get("breakdown") or [])
                     for e in _ledger_since_removal(profile, sub_label, tier)
                 )
                 if not already:
@@ -802,6 +805,9 @@ def _sub_credit_total(profile: dict, sub: dict) -> float:
             total += float(e.get("amount", 0.0) or 0.0)          # already reversed (negative)
     dupes = sum(1 for s in profile.get("subs", [])
                 if (s.get("sub_name") or "").strip() == name and (s.get("tier") or "").strip().lower() == tier)
+    # months/upfront earned on plans this sub had before a plan change
+    for h in sub.get("tier_history") or []:
+        total += _sub_credit_total(profile, dict(sub, tier=h.get("tier", ""), tier_history=[])) * max(dupes, 1)
     return round(total / max(dupes, 1), 2)
 
 
@@ -900,6 +906,29 @@ def _cancel_sub(profile: dict, sub: dict, cancel_date: str, note: str,
     return _reverse_after_cancel(profile, sub, cancel_date, note, paid_months)
 
 
+def _change_sub_tier(profile: dict, sub: dict, new_tier: str) -> str:
+    """Same Stripe sub switched plans (Pro -> Pro+ etc). New rate from the first month not
+    already credited at the old rate - never two credits for one month. Old months stay at
+    the old rate. Moving onto a yearly plan books its upfront. Returns the first new-rate month."""
+    from datetime import date as _date
+    old = (sub.get("tier") or "").strip().lower()
+    today = _date.today()
+    cur = f"{today.year:04d}-{today.month:02d}"
+    nxt = f"{today.year + (today.month == 12):04d}-{(today.month % 12) + 1:02d}"
+    since = nxt if _net_credit_months(profile, sub).get(cur, 0) > 0 else cur
+    sub.setdefault("tier_history", []).append({"tier": old, "until": since})
+    sub["tier"] = new_tier
+    sub["tier_since"] = f"{since}-01"
+    _append_log(profile, {"type": "status_change", "sub_name": sub.get("sub_name", ""), "tier": new_tier,
+                          "old_status": old, "new_status": f"plan {old} -> {new_tier} from {since}",
+                          "date": today.isoformat(), "amount": 0.0})
+    if new_tier in TIER_YEARLY_RATE:
+        up = TIER_YEARLY_RATE[new_tier]
+        _append_log(profile, {"type": "new_sub_yearly", "sub_name": sub.get("sub_name", ""), "tier": new_tier,
+                              "date": today.isoformat(), "amount": up, "note": f"Yearly upfront (plan change) — ${up:.2f}"})
+    return since
+
+
 def _credit_month(profile: dict, month: str) -> Dict[str, Any]:
     """Credit `month` for every ACTIVE monthly sub that doesn't have it yet. Per sub, not
     per affiliate: the old check skipped the whole affiliate for the month if any
@@ -911,7 +940,7 @@ def _credit_month(profile: dict, month: str) -> Dict[str, Any]:
         if (sub.get("status") or "") != "active":
             continue
         tag = _sub_tag(sub)
-        if not tag or (sub.get("start_date") or "")[:7] > month:
+        if not tag or (sub.get("tier_since") or sub.get("start_date") or "")[:7] > month:
             continue
         need[tag] = need.get(tag, 0) + 1
         rates[tag] = TIER_MONTHLY_RATE[(sub.get("tier") or "").strip().lower()]
@@ -2119,6 +2148,22 @@ def _affiliate_stripe_sync(dry_run: bool = True) -> Dict[str, Any]:
                 if d.get("email"):
                     email_code[d["email"].strip().lower()] = (c or "").strip().upper()
 
+        # Customer tie (Kory 2026-10-17): once an email uses an affiliate's code, that email is
+        # that affiliate's for good - upgrades, re-subscribes and no-code subs all go to them.
+        # First affiliate wins, even if the customer later types a different code.
+        tie: Dict[str, str] = {k: v for k, v in (state.get("customer_tie") or {}).items() if v in profiles}
+        _led = []
+        for c_, p_ in profiles.items():
+            for x in p_.get("subs", []):
+                em_ = (x.get("email") or (x.get("sub_name") if "@" in (x.get("sub_name") or "") else "") or "").strip().lower()
+                if em_:
+                    _led.append((x.get("start_date") or "9999", em_, c_))
+        for _, em_, c_ in sorted(_led):
+            tie.setdefault(em_, c_)
+        for em_, c_ in sorted(email_code.items()):
+            if c_ in profiles:
+                tie.setdefault(em_, c_)
+
         actions: List[Dict[str, Any]] = []
         needs_link: List[Dict[str, Any]] = []
         waiting: List[Dict[str, Any]] = []
@@ -2145,8 +2190,19 @@ def _affiliate_stripe_sync(dry_run: bool = True) -> Dict[str, Any]:
                 code, ls = by_stripe[sid]
                 p = profiles[code]
                 _seen(code, email, tier, st_, end_date, ls.get("sub_name"), cape)
+                old_tier = (ls.get("tier") or "").strip().lower()
+                if not ended and ls.get("status") == "active" and old_tier != tier:
+                    act = {"action": "tier_change", "code": code, "sub": ls.get("sub_name"), "email": email,
+                           "tier": tier, "note": f"{old_tier} -> {tier}"}
+                    if not dry_run:
+                        act["from_month"] = _change_sub_tier(p, ls, tier)
+                    actions.append(act)
                 if ended and ls.get("status") == "active":
                     paid = _paid_invoices(_stripe_sub_invoices(sid))
+                    if ls.get("tier_since"):   # only invoices on the current plan pay its months
+                        _since = ls["tier_since"][:7]
+                        paid = [i for i in paid if _ts_date((i.get("status_transitions") or {}).get("paid_at")
+                                                            or i.get("created"))[:7] >= _since]
                     act = {"action": "cancel", "code": code, "sub": ls.get("sub_name"), "email": email,
                            "tier": ls.get("tier"), "date": end_date, "paid_invoices": len(paid)}
                     if not dry_run:
@@ -2176,14 +2232,21 @@ def _affiliate_stripe_sync(dry_run: bool = True) -> Dict[str, Any]:
                     waiting.append({"email": email, "tier": tier, "stripe_sub_id": sid,
                                     "trial_end": _ts_date(ss.get("trial_end"))})
                 continue
-            code = _extract_promo_code(ss, cust)
-            if not code and invoices:
-                code = _extract_promo_code_from_invoice(invoices[0].get("id") or "")
-            if not code:
-                code = email_code.get(email)
-            code = (code or "").strip().upper()
+            explicit = _extract_promo_code(ss, cust)
+            if not explicit and invoices:
+                explicit = _extract_promo_code_from_invoice(invoices[0].get("id") or "")
+            explicit = (explicit or "").strip().upper()
+            tied = tie.get(email) if email else None
+            code = tied or (explicit if explicit in profiles else "")
             if code not in profiles:
                 continue
+            attr_note = ""
+            if tied and not explicit:
+                attr_note = f"no code on this sub - tied to {tied}"
+            elif tied and explicit and explicit != tied:
+                attr_note = f"used {explicit}, tied to {tied}"
+            if email and email not in tie:
+                tie[email] = code
             p = profiles[code]
             first_paid = _ts_date((paid[0].get("status_transitions") or {}).get("paid_at")
                                   or paid[0].get("created"))
@@ -2195,9 +2258,10 @@ def _affiliate_stripe_sync(dry_run: bool = True) -> Dict[str, Any]:
             _seen(code, email, tier, st_, end_date, legacy.get("sub_name") if legacy is not None else "", cape)
             if legacy is not None:
                 act = {"action": "link", "code": code, "sub": legacy.get("sub_name"), "email": email,
-                       "tier": tier, "stripe_sub_id": sid}
+                       "tier": tier, "stripe_sub_id": sid, "note": attr_note}
                 if (legacy.get("tier") or "").lower() != tier:
-                    act["note"] = f"ledger tier {legacy.get('tier')} != Stripe {tier} (left as is)"
+                    act["note"] = (attr_note + "; " if attr_note else "") + \
+                        f"ledger tier {legacy.get('tier')} != Stripe {tier} (updated on next sync)"
                 actions.append(act)
                 if not dry_run:
                     legacy["stripe_sub_id"], legacy["email"] = sid, email
@@ -2206,7 +2270,8 @@ def _affiliate_stripe_sync(dry_run: bool = True) -> Dict[str, Any]:
                                     paid_months=len(paid) if monthly else None)
                 continue
             rec = {"code": code, "email": email, "tier": tier, "stripe_sub_id": sid,
-                   "first_paid": first_paid, "paid_invoices": len(paid), "ended": ended, "end_date": end_date}
+                   "first_paid": first_paid, "paid_invoices": len(paid), "ended": ended, "end_date": end_date,
+                   "note": attr_note}
             if first_paid >= auto_from:
                 actions.append(dict(rec, action="add"))
                 if not dry_run:
@@ -2221,11 +2286,11 @@ def _affiliate_stripe_sync(dry_run: bool = True) -> Dict[str, Any]:
 
         summary = {"ran_at": _now(), "dry_run": dry_run, "auto_from": auto_from,
                    "counts": {k: sum(1 for a in actions if a["action"] == k)
-                              for k in ("add", "cancel", "link", "refund_reverse")},
+                              for k in ("add", "cancel", "link", "refund_reverse", "tier_change")},
                    "needs_link": len(needs_link), "waiting_trial": len(waiting)}
         if not dry_run:
             _save_profiles(profiles)
-            state.update({"auto_from": auto_from, "last_run": summary})
+            state.update({"auto_from": auto_from, "last_run": summary, "customer_tie": tie})
         # needs_link is a worklist, not a ledger change: save it on Preview too so items can be
         # linked straight from the preview (2026-10-17). Ledger only changes on Apply.
         state.update({"needs_link": needs_link, "waiting_trial": waiting, "stripe_by_code": by_code})
