@@ -689,7 +689,7 @@ def _compute_balance(profile: dict) -> float:
     total = 0.0
     for entry in profile.get("log", []):
         etype = entry.get("type", "")
-        if etype in ("new_sub_yearly", "recurring", "payout"):
+        if etype in ("new_sub_yearly", "recurring", "payout", "sub_removed"):
             total += entry.get("amount", 0.0)
     return round(total, 2)
 
@@ -697,6 +697,131 @@ def _append_log(profile: dict, entry: dict) -> None:
     if "log" not in profile:
         profile["log"] = []
     profile["log"].append(entry)
+
+
+def _add_new_sub(profile: dict, subs: list, sub_name: str, tier: str, start_date: str,
+                 status: str, cancelled_date: Optional[str], email: Optional[str] = None) -> str:
+    """New sub + its ledger effects (monthly backfill / yearly upfront). Extracted
+    2026-10-17 from admin_affiliate_sub_add unchanged so /subs/move can reuse it."""
+    body_sub_name, body_start_date, body_cancelled_date = sub_name, start_date, cancelled_date
+    import uuid as _uuid
+    sub_id = str(_uuid.uuid4())[:8]
+    new_sub = {
+        "sub_id": sub_id,
+        "sub_name": body_sub_name.strip(),
+        "tier": tier,
+        "start_date": body_start_date,
+        "status": status,
+        "cancelled_date": body_cancelled_date,
+    }
+    if email:
+        new_sub["email"] = email.strip().lower()
+    subs.append(new_sub)
+    # Backfill monthly recurring for backdated subs
+    if tier in TIER_MONTHLY_RATE and status == "active":
+        from datetime import date as _date
+        import calendar as _cal
+        rate = TIER_MONTHLY_RATE[tier]
+        try:
+            start_year, start_month, _ = [int(x) for x in body_start_date.split("-")]
+            today = _date.today()
+            y, m = start_year, start_month
+            while (y, m) <= (today.year, today.month):
+                month_str = f"{y:04d}-{m:02d}"
+                # Don't double-fire for this specific sub+month combo
+                sub_label = body_sub_name.strip()
+                already = any(
+                    e.get("type") == "recurring"
+                    and e.get("month") == month_str
+                    and sub_label in (e.get("breakdown") or [""])[0]
+                    for e in _ledger_since_removal(profile, sub_label, tier)
+                )
+                if not already:
+                    _append_log(profile, {
+                        "type": "recurring",
+                        "month": month_str,
+                        "amount": rate,
+                        "breakdown": [f"{sub_label} ({tier}) +${rate:.2f}"],
+                        "date": f"{month_str}-01",
+                    })
+                m += 1
+                if m > 12:
+                    m = 1
+                    y += 1
+        except Exception as e:
+            print(f"[affiliate] backfill failed: {e}")
+    # Log the new sub + any upfront yearly payout
+    log_entry: Dict[str, Any] = {
+        "type": "new_sub",
+        "sub_name": body_sub_name.strip(),
+        "tier": tier,
+        "date": body_start_date,
+        "amount": 0.0,
+    }
+    if tier in TIER_YEARLY_RATE:
+        upfront = TIER_YEARLY_RATE[tier]
+        log_entry["type"] = "new_sub_yearly"
+        log_entry["amount"] = upfront
+        log_entry["note"] = f"Yearly upfront — ${upfront:.2f}"
+    _append_log(profile, log_entry)
+    return sub_id
+
+
+def _ledger_since_removal(profile: dict, name: str, tier: str) -> list:
+    """Ledger entries after this name+tier's last sub_removed line. Credits before a
+    removal were already reversed, so a re-added sub must not see them as paid
+    (backfill) and a second delete must not reverse them twice."""
+    log = profile.get("log", [])
+    cut = 0
+    for i, e in enumerate(log):
+        if (e.get("type") == "sub_removed" and (e.get("sub_name") or "").strip() == name
+                and (e.get("tier") or "").strip().lower() == tier):
+            cut = i + 1
+    return log[cut:]
+
+
+def _sub_credit_total(profile: dict, sub: dict) -> float:
+    """What this sub has earned the affiliate so far, read from the ledger: its yearly
+    upfront plus its share of every monthly recurring entry (backfill or generated).
+    Ledger lines name subs as "<name> (<tier>) +$<rate>", so identical name+tier subs on
+    the same code share the matched total (2026-10-17)."""
+    name = (sub.get("sub_name") or "").strip()
+    tier = (sub.get("tier") or "").strip().lower()
+    total = 0.0
+    rate = TIER_MONTHLY_RATE.get(tier)
+    tag = f"{name} ({tier}) +${rate:.2f}" if rate is not None else None
+    for e in _ledger_since_removal(profile, name, tier):
+        t = e.get("type")
+        if t == "new_sub_yearly":
+            if (e.get("sub_name") or "").strip() == name and (e.get("tier") or "").lower() == tier:
+                total += float(e.get("amount", 0.0) or 0.0)
+        elif t == "recurring" and tag:
+            total += rate * sum(1 for b in (e.get("breakdown") or []) if b == tag)
+    dupes = sum(1 for s in profile.get("subs", [])
+                if (s.get("sub_name") or "").strip() == name and (s.get("tier") or "").strip().lower() == tier)
+    return round(total / max(dupes, 1), 2)
+
+
+def _remove_sub(profile: dict, sub_id: str, note: str) -> Dict[str, Any]:
+    """Remove a sub and book a reversing ledger entry for everything it earned.
+    History is never rewritten - the reversal is its own line."""
+    subs = profile.get("subs", [])
+    sub = next((s for s in subs if s.get("sub_id") == sub_id), None)
+    if sub is None:
+        raise HTTPException(status_code=404, detail=f"sub {sub_id} not found on {profile.get('code')}")
+    credit = _sub_credit_total(profile, sub)
+    profile["subs"] = [s for s in subs if s.get("sub_id") != sub_id]
+    from datetime import date as _date
+    _append_log(profile, {
+        "type": "sub_removed",
+        "sub_id": sub_id,
+        "sub_name": sub.get("sub_name", ""),
+        "tier": sub.get("tier", ""),
+        "amount": -credit,
+        "date": _date.today().isoformat(),
+        "note": note or "removed by admin",
+    })
+    return {"sub": sub, "reversed": credit}
 
 # -------------------------
 # Models
@@ -759,6 +884,23 @@ class AffiliateSubIn(BaseModel):
     status: str = "active"  # active | cancelled
     cancelled_date: Optional[str] = None
     sub_id: Optional[str] = None  # for updates
+    email: Optional[str] = None   # optional: links the sub to a detected Stripe signup
+
+class AffiliateSubDeleteIn(BaseModel):
+    code: str
+    sub_id: str
+    dry_run: bool = False      # True -> report what would be reversed, change nothing
+    note: str = ""
+
+class AffiliateSubMoveIn(BaseModel):
+    from_code: str
+    sub_id: str
+    to_code: str
+    dry_run: bool = False
+
+class AffiliateDismissIn(BaseModel):
+    code: str
+    email: str
 
 class AffiliatePayoutIn(BaseModel):
     code: str
@@ -1617,70 +1759,148 @@ def admin_affiliate_sub_add(
                     })
                 break
     else:
-        # New sub
-        import uuid as _uuid
-        sub_id = str(_uuid.uuid4())[:8]
-        new_sub = {
-            "sub_id": sub_id,
-            "sub_name": body.sub_name.strip(),
-            "tier": tier,
-            "start_date": body.start_date,
-            "status": status,
-            "cancelled_date": body.cancelled_date,
-        }
-        subs.append(new_sub)
-        # Backfill monthly recurring for backdated subs
-        if tier in TIER_MONTHLY_RATE and status == "active":
-            from datetime import date as _date
-            import calendar as _cal
-            rate = TIER_MONTHLY_RATE[tier]
-            try:
-                start_year, start_month, _ = [int(x) for x in body.start_date.split("-")]
-                today = _date.today()
-                y, m = start_year, start_month
-                while (y, m) <= (today.year, today.month):
-                    month_str = f"{y:04d}-{m:02d}"
-                    # Don't double-fire for this specific sub+month combo
-                    sub_label = body.sub_name.strip()
-                    already = any(
-                        e.get("type") == "recurring"
-                        and e.get("month") == month_str
-                        and sub_label in (e.get("breakdown") or [""])[0]
-                        for e in profile.get("log", [])
-                    )
-                    if not already:
-                        _append_log(profile, {
-                            "type": "recurring",
-                            "month": month_str,
-                            "amount": rate,
-                            "breakdown": [f"{sub_label} ({tier}) +${rate:.2f}"],
-                            "date": f"{month_str}-01",
-                        })
-                    m += 1
-                    if m > 12:
-                        m = 1
-                        y += 1
-            except Exception as e:
-                print(f"[affiliate] backfill failed: {e}")
-        # Log the new sub + any upfront yearly payout
-        log_entry: Dict[str, Any] = {
-            "type": "new_sub",
-            "sub_name": body.sub_name.strip(),
-            "tier": tier,
-            "date": body.start_date,
-            "amount": 0.0,
-        }
-        if tier in TIER_YEARLY_RATE:
-            upfront = TIER_YEARLY_RATE[tier]
-            log_entry["type"] = "new_sub_yearly"
-            log_entry["amount"] = upfront
-            log_entry["note"] = f"Yearly upfront — ${upfront:.2f}"
-        _append_log(profile, log_entry)
-
+        _add_new_sub(profile, subs, body.sub_name, tier, body.start_date, status,
+                     body.cancelled_date, email=body.email)
     profile["subs"] = subs
     profiles[code] = profile
     _save_profiles(profiles)
     return {"ok": True, "code": code}
+
+
+@app.post("/admin/affiliate/subs/delete")
+def admin_affiliate_sub_delete(
+    body: AffiliateSubDeleteIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    """Remove a sub added to the wrong code. Books a reversal for everything it earned
+    (sub_removed line) instead of rewriting history. dry_run=True -> preview only."""
+    code = body.code.strip().upper()
+    profiles = _load_profiles()
+    if code not in profiles:
+        raise HTTPException(status_code=404, detail=f"Affiliate {code} not found")
+    profile = profiles[code]
+    sub = next((x for x in profile.get("subs", []) if x.get("sub_id") == body.sub_id), None)
+    if sub is None:
+        raise HTTPException(status_code=404, detail=f"sub {body.sub_id} not found on {code}")
+    credit = _sub_credit_total(profile, sub)
+    bal = _compute_balance(profile)
+    if body.dry_run:
+        return {"ok": True, "dry_run": True, "code": code, "sub": sub, "reverses": credit,
+                "balance_before": bal, "balance_after": round(bal - credit, 2)}
+    res = _remove_sub(profile, body.sub_id, body.note.strip())
+    profiles[code] = profile
+    _save_profiles(profiles)
+    return {"ok": True, "code": code, "removed": res["sub"].get("sub_name"), "reversed": res["reversed"],
+            "new_balance": _compute_balance(profile)}
+
+
+@app.post("/admin/affiliate/subs/move")
+def admin_affiliate_sub_move(
+    body: AffiliateSubMoveIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    """Move a sub from the wrong code to the right one in one step: reverse its credit
+    on the source, re-add it on the destination (normal backfill / yearly upfront)."""
+    src, dst = body.from_code.strip().upper(), body.to_code.strip().upper()
+    if src == dst:
+        raise HTTPException(status_code=400, detail="from_code and to_code are the same")
+    profiles = _load_profiles()
+    for c in (src, dst):
+        if c not in profiles:
+            raise HTTPException(status_code=404, detail=f"Affiliate {c} not found")
+    sp = profiles[src]
+    sub = next((x for x in sp.get("subs", []) if x.get("sub_id") == body.sub_id), None)
+    if sub is None:
+        raise HTTPException(status_code=404, detail=f"sub {body.sub_id} not found on {src}")
+    credit = _sub_credit_total(sp, sub)
+    if body.dry_run:
+        return {"ok": True, "dry_run": True, "sub": sub, "from": src, "to": dst, "reverses_on_from": credit}
+    res = _remove_sub(sp, body.sub_id, f"moved to {dst}")
+    dp = profiles[dst]
+    dsubs = dp.get("subs", [])
+    new_id = _add_new_sub(dp, dsubs, sub.get("sub_name", ""), (sub.get("tier") or "").lower(),
+                          sub.get("start_date", ""), (sub.get("status") or "active").lower(),
+                          sub.get("cancelled_date"), email=sub.get("email"))
+    dp["subs"] = dsubs
+    profiles[src], profiles[dst] = sp, dp
+    _save_profiles(profiles)
+    return {"ok": True, "from": src, "to": dst, "reversed_on_from": res["reversed"], "new_sub_id": new_id,
+            "from_balance": _compute_balance(sp), "to_balance": _compute_balance(dp)}
+
+
+@app.get("/admin/affiliate/unassigned")
+def admin_affiliate_unassigned(
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    """Stripe signups seen with a promo code (license check -> affiliates.json) that are
+    not in that code's payout ledger yet - so subs don't have to be typed in by hand.
+    A signup counts as assigned if a sub has its email, or a sub_name equal to the email,
+    or it was dismissed."""
+    from datetime import datetime as _dt, timezone as _tz
+    detected = _load_json(AFFILIATES_PATH, {})
+    profiles = _load_profiles()
+    out: Dict[str, Any] = {}
+    for raw_code, info in detected.items():
+        code = (raw_code or "").strip().upper()
+        prof = profiles.get(code) or {}
+        have = set()
+        for x in prof.get("subs", []):
+            if x.get("email"):
+                have.add(x["email"].strip().lower())
+            have.add((x.get("sub_name") or "").strip().lower())
+        have |= {e.strip().lower() for e in prof.get("dismissed", [])}
+        rows = []
+        for d in info.get("subs", []):
+            em = (d.get("email") or "").strip().lower()
+            if not em or em in have:
+                continue
+            fs = d.get("first_seen")
+            try:
+                start = _dt.fromtimestamp(float(fs), _tz.utc).date().isoformat()
+            except Exception:
+                start = ""
+            rows.append({"email": em, "tier": d.get("tier", ""), "first_seen": start})
+        if rows:
+            out[code] = {"has_profile": bool(prof), "signups": rows}
+    return {"ok": True, "unassigned": out}
+
+
+@app.post("/admin/affiliate/unassigned/dismiss")
+def admin_affiliate_unassigned_dismiss(
+    body: AffiliateDismissIn,
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    """Hide a detected signup (already entered under a gamertag, a tester, etc.)."""
+    code = body.code.strip().upper()
+    profiles = _load_profiles()
+    if code not in profiles:
+        raise HTTPException(status_code=404, detail=f"Affiliate {code} not found")
+    p = profiles[code]
+    em = body.email.strip().lower()
+    if em and em not in p.setdefault("dismissed", []):
+        p["dismissed"].append(em)
+    _save_profiles(profiles)
+    return {"ok": True, "code": code, "dismissed": em}
 
 
 @app.post("/admin/affiliate/payouts")
