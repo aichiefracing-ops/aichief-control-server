@@ -2393,6 +2393,42 @@ def admin_affiliate_generate_recurring(
     return {"ok": True, "month": month, "results": results}
 
 
+# Affiliate-facing (Crew tab) view - 2026-10-17. Auto-synced subs are named by the
+# customer's email; affiliates must never see customer emails or Stripe ids. The Crew tab
+# (ai_chief_ui) only renders new_sub / recurring / payout / status_change, so the newer
+# ledger lines are shown as status_change rows ("name -> what happened"), amount intact.
+def _crew_mask(name: str) -> str:
+    name = (name or "").strip()
+    if "@" in name:
+        return (name.split("@", 1)[0][:2] or "?") + "\u2022\u2022\u2022"
+    return name
+
+
+def _crew_sub(x: dict) -> dict:
+    return {"sub_id": x.get("sub_id"), "sub_name": _crew_mask(x.get("sub_name", "")),
+            "tier": x.get("tier", ""), "start_date": x.get("start_date", ""),
+            "status": x.get("status", ""), "cancelled_date": x.get("cancelled_date")}
+
+
+def _crew_log(e: dict) -> dict:
+    t = e.get("type", "")
+    out = {k: e.get(k) for k in ("type", "date", "amount", "month", "tier", "note", "new_status", "old_status")
+           if k in e}
+    if "sub_name" in e:
+        out["sub_name"] = _crew_mask(e.get("sub_name", ""))
+    if e.get("breakdown"):
+        out["breakdown"] = [_crew_mask(b.split(" (", 1)[0]) + (" (" + b.split(" (", 1)[1] if " (" in b else "")
+                            for b in e["breakdown"]]
+    if t == "sub_removed":
+        out.update(type="status_change", new_status="removed (wrong code)")
+    elif t == "cancel_adjust":
+        n = len(e.get("months") or [])
+        out.update(type="status_change", new_status=f"cancelled - {n} unpaid month{'s' if n != 1 else ''} reversed")
+    elif t == "refund_reversal":
+        out.update(type="status_change", new_status="refunded - yearly reversed")
+    return out
+
+
 @app.get("/affiliate/dashboard")
 def affiliate_dashboard(email: str) -> Dict[str, Any]:
     """Public endpoint — no auth key. Returns affiliate data for the given email.
@@ -2409,8 +2445,9 @@ def affiliate_dashboard(email: str) -> Dict[str, Any]:
                 "code": code,
                 "w9": profile.get("w9", False),
                 "balance": _compute_balance(profile),
-                "subs": profile.get("subs", []),
-                "log": sorted(profile.get("log", []), key=lambda x: x.get("date", ""), reverse=True),
+                "subs": [_crew_sub(x) for x in profile.get("subs", [])],
+                "log": sorted((_crew_log(e) for e in profile.get("log", [])),
+                              key=lambda x: x.get("date", ""), reverse=True),
                 "sub_count": sum(1 for s in profile.get("subs", []) if s.get("status") == "active"),
             }
     raise HTTPException(status_code=404, detail="Not an affiliate")
