@@ -242,6 +242,24 @@ DAISY_CHECKOUT_CANCEL_URL = (
 DAISY_DLC_ZIP_URL = (os.getenv("DAISY_DLC_ZIP_URL") or "").strip()
 DAISY_DLC_ZIP_PATH = (os.getenv("DAISY_DLC_ZIP_PATH") or "").strip()
 
+# ── Spotter DLC — Harold (one-time purchase, 2026-11-14) ─────
+# Same shape as Daisy, own env vars. Daisy's code paths are untouched.
+STRIPE_HAROLD_PRICE_ID = (os.getenv("STRIPE_HAROLD_PRICE_ID") or "").strip()
+STRIPE_HAROLD_PRODUCT_IDS = [
+    p.strip() for p in (os.getenv("STRIPE_HAROLD_PRODUCT_IDS") or "").split(",") if p.strip()
+]
+STRIPE_HAROLD_PAYMENT_LINK = (os.getenv("STRIPE_HAROLD_PAYMENT_LINK") or "").strip()
+HAROLD_CHECKOUT_SUCCESS_URL = (
+    os.getenv("HAROLD_CHECKOUT_SUCCESS_URL")
+    or "https://aichiefracing.com/harold-thanks"
+).strip()
+HAROLD_CHECKOUT_CANCEL_URL = (
+    os.getenv("HAROLD_CHECKOUT_CANCEL_URL")
+    or "https://aichiefracing.com/spotters"
+).strip()
+HAROLD_DLC_ZIP_URL = (os.getenv("HAROLD_DLC_ZIP_URL") or "").strip()
+HAROLD_DLC_ZIP_PATH = (os.getenv("HAROLD_DLC_ZIP_PATH") or "").strip()
+
 # Manual entitlement overrides (comp testers / refunds). email -> {"spotter_daisy": true}
 DLC_OVERRIDES_PATH = DATA_DIR / "dlc_overrides.json"
 # ──────────────────────────────────────────────────────────────
@@ -1388,13 +1406,127 @@ def _email_owns_daisy(email: str) -> bool:
     return _stripe_email_owns_daisy(email)
 
 
+def _stripe_email_owns_dlc(email: str, dlc: str, price_id: str, product_ids: List[str]) -> bool:
+    """Generic version of _stripe_email_owns_daisy for newer packs (Harold+).
+    1) PaymentIntent search on the metadata stamped at checkout (dlc + email).
+    2) Fallback: the customer's paid Checkout Sessions, matched on price/product."""
+    if not STRIPE_SECRET_KEY:
+        return False
+    try:
+        q = (f'metadata["dlc"]:"{dlc}" AND '
+             f'metadata["email"]:"{email}" AND status:"succeeded"')
+        r = requests.get("https://api.stripe.com/v1/payment_intents/search",
+                         params={"query": q, "limit": 1},
+                         auth=(STRIPE_SECRET_KEY, ""), timeout=8)
+        if r.ok and (r.json().get("data") or []):
+            print(f"[dlc] {email} owns {dlc} (payment_intent search hit)")
+            return True
+    except Exception as e:
+        print(f"[dlc] PI search error ({dlc}): {e}")
+    if not (price_id or product_ids):
+        return False
+    try:
+        cust_r = requests.get("https://api.stripe.com/v1/customers",
+                              params={"email": email, "limit": 5},
+                              auth=(STRIPE_SECRET_KEY, ""), timeout=8)
+        if not cust_r.ok:
+            return False
+        for customer in cust_r.json().get("data", []):
+            cid = customer.get("id")
+            if not cid:
+                continue
+            sess_r = requests.get("https://api.stripe.com/v1/checkout/sessions",
+                                  params={"customer": cid, "limit": 25, "expand[]": "data.line_items"},
+                                  auth=(STRIPE_SECRET_KEY, ""), timeout=8)
+            if not sess_r.ok:
+                continue
+            for sess in sess_r.json().get("data", []):
+                if sess.get("payment_status") != "paid":
+                    continue
+                for li in (sess.get("line_items", {}) or {}).get("data", []):
+                    price = li.get("price", {}) or {}
+                    if price_id and price.get("id") == price_id:
+                        return True
+                    if price.get("product") in product_ids:
+                        return True
+    except Exception as e:
+        print(f"[dlc] session scan error ({dlc}): {e}")
+    return False
+
+
+def _email_owns_harold(email: str) -> bool:
+    email = (email or "").strip().lower()
+    if not email:
+        return False
+    if email in DEV_EMAILS:
+        return True
+    if _email_has_dlc_override(email, "spotter_harold"):
+        return True
+    return _stripe_email_owns_dlc(email, "spotter_harold",
+                                  STRIPE_HAROLD_PRICE_ID, STRIPE_HAROLD_PRODUCT_IDS)
+
+
 @app.post("/license/dlc")
 def license_dlc(body: LicenseCheckIn) -> Dict[str, Any]:
     """Return which DLC packs an email owns. Public (email-gated) like /license/check."""
     email = (body.email or "").strip().lower()
     owns_daisy = _email_owns_daisy(email)
-    print(f"[dlc] {email!r} -> spotter_daisy={owns_daisy}")
-    return {"ok": True, "email": email, "dlc": {"spotter_daisy": owns_daisy}}
+    owns_harold = _email_owns_harold(email)
+    print(f"[dlc] {email!r} -> spotter_daisy={owns_daisy} spotter_harold={owns_harold}")
+    return {"ok": True, "email": email,
+            "dlc": {"spotter_daisy": owns_daisy, "spotter_harold": owns_harold}}
+
+
+@app.post("/checkout/spotter-harold")
+def checkout_spotter_harold(body: DaisyCheckoutIn) -> Dict[str, Any]:
+    """One-time Stripe Checkout Session for the Harold pack (mirrors Daisy)."""
+    email = (body.email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="email required")
+    if _email_owns_harold(email):
+        return {"ok": True, "already_owned": True, "url": ""}
+    if STRIPE_SECRET_KEY and STRIPE_HAROLD_PRICE_ID:
+        try:
+            form = [
+                ("mode", "payment"),
+                ("customer_creation", "always"),
+                ("customer_email", email),
+                ("line_items[0][price]", STRIPE_HAROLD_PRICE_ID),
+                ("line_items[0][quantity]", "1"),
+                ("success_url", HAROLD_CHECKOUT_SUCCESS_URL),
+                ("cancel_url", HAROLD_CHECKOUT_CANCEL_URL),
+                ("metadata[dlc]", "spotter_harold"),
+                ("metadata[email]", email),
+                ("payment_intent_data[metadata][dlc]", "spotter_harold"),
+                ("payment_intent_data[metadata][email]", email),
+            ]
+            r = requests.post("https://api.stripe.com/v1/checkout/sessions",
+                              data=form, auth=(STRIPE_SECRET_KEY, ""), timeout=12)
+            if r.ok:
+                url = r.json().get("url") or ""
+                if url:
+                    return {"ok": True, "url": url}
+            print(f"[dlc] harold checkout session create failed: {r.status_code} {r.text[:300]}")
+        except Exception as e:
+            print(f"[dlc] harold checkout session exception: {e}")
+    if STRIPE_HAROLD_PAYMENT_LINK:
+        sep = "&" if "?" in STRIPE_HAROLD_PAYMENT_LINK else "?"
+        return {"ok": True, "url": f"{STRIPE_HAROLD_PAYMENT_LINK}{sep}prefilled_email={email}"}
+    raise HTTPException(status_code=500, detail="Harold checkout not configured (set STRIPE_HAROLD_PRICE_ID or STRIPE_HAROLD_PAYMENT_LINK)")
+
+
+@app.get("/dlc/spotter-harold")
+def dlc_download_harold(email: str):
+    """Serve the Harold WAV pack (.zip) ONLY to an email that owns it."""
+    email = (email or "").strip().lower()
+    if not _email_owns_harold(email):
+        raise HTTPException(status_code=403, detail="Harold not owned by this email")
+    if HAROLD_DLC_ZIP_URL:
+        return RedirectResponse(url=HAROLD_DLC_ZIP_URL, status_code=302)
+    if HAROLD_DLC_ZIP_PATH and Path(HAROLD_DLC_ZIP_PATH).exists():
+        return FileResponse(HAROLD_DLC_ZIP_PATH, media_type="application/zip",
+                            filename="harold_voice.zip")
+    raise HTTPException(status_code=404, detail="Harold pack not hosted (set HAROLD_DLC_ZIP_URL or HAROLD_DLC_ZIP_PATH)")
 
 
 @app.post("/checkout/spotter-daisy")
