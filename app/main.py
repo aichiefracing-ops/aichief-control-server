@@ -4549,3 +4549,71 @@ def admin_team_rooms(
                 "active_custid": (st.get("live") or {}).get("active_custid"),
             })
         return {"ok": True, "enforce": TEAM_RELAY_ENFORCE, "rooms": rooms}
+
+
+# ── Voice pod watcher + phone restart (2026-11-21) ─────────────
+# Pings TTS_PRIMARY_URL/health every minute; ntfy push to Kory's phone on down/stuck/back-up,
+# with a one-tap "Restart voice server" button (restarts the voice server process only).
+# Setup + env vars: see app/voicepod_watch.py docstring.
+try:
+    from app import voicepod_watch as _vpw
+except Exception:
+    import voicepod_watch as _vpw  # type: ignore
+
+
+@app.on_event("startup")
+def _voicepod_start() -> None:
+    _vpw.start()
+
+
+@app.post("/voicepod/restart", response_class=HTMLResponse)
+def voicepod_restart_from_phone(t: str = "") -> str:
+    """Hit by the ntfy notification button. One-time token instead of the admin key,
+    because the button's URL passes through ntfy."""
+    if not _vpw.use_token(t):
+        return "<h3>Link expired or already used.</h3>"
+    res = _vpw.restart_voice()
+    _vpw.push("Voice restart: " + ("sent" if res["ok"] else "FAILED"), res["why"],
+              "default" if res["ok"] else "high")
+    return f"<h3>{'Restart sent' if res['ok'] else 'Restart failed'}</h3><p>{res['why']}</p>"
+
+
+@app.get("/admin/voicepod")
+def admin_voicepod(
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    return {"ok": True, **_vpw.snapshot(), "pod_now": _vpw.pod_status()}
+
+
+@app.post("/admin/voicepod/restart")
+def admin_voicepod_restart(
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    return _vpw.restart_voice()
+
+
+@app.post("/admin/voicepod/test-alert")
+def admin_voicepod_test_alert(
+    x_aichief_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    control_api_key_hdr: Optional[str] = Header(default=None, alias="CONTROL_API_KEY"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    control_api_key: Optional[str] = Header(default=None, alias="control-api-key"),
+) -> Dict[str, Any]:
+    """Sends a test push WITH a live restart button — also your 'restart anytime' handle."""
+    _require_admin(x_aichief_key, authorization, control_api_key_hdr, x_api_key, control_api_key)
+    s = _vpw.snapshot()
+    sent = _vpw.push("Voice pod test", f"Watcher status: {s['status']}. Button below restarts the voice server.",
+                     "default", "test_tube", restart_button=True)
+    return {"ok": sent, "status": s}
+# ──────────────────────────────────────────────────────────────
