@@ -2218,7 +2218,47 @@ def _stripe_all_subs() -> list:
         after = data[-1].get("id")
 
 
+# 2026-11-26: "Preview sync" timed out at 120 s. The sync made one Stripe call per
+# subscription (invoices) plus one per customer (charges) - N+1 calls that grow with
+# every subscriber. During a sync run, invoices and charges are now fetched ONCE in bulk
+# (paginated, 100 per page) and served from this cache. Outside a run the helpers still
+# make their single call as before.
+_SYNC_BULK: Optional[Dict[str, Dict[str, list]]] = None
+
+
+def _stripe_list_all(path: str, params: list) -> list:
+    out, after = [], None
+    while True:
+        p = list(params) + [("limit", "100")]
+        if after:
+            p.append(("starting_after", after))
+        d = _stripe_get(path, p)
+        data = d.get("data") or []
+        out.extend(data)
+        if not d.get("has_more") or not data:
+            return out
+        after = data[-1].get("id")
+
+
+def _sync_bulk_load() -> Dict[str, Dict[str, list]]:
+    inv: Dict[str, list] = {}
+    for i in _stripe_list_all("invoices", []):
+        sid = i.get("subscription")
+        sid = sid.get("id") if isinstance(sid, dict) else sid
+        if sid:
+            inv.setdefault(sid, []).append(i)
+    ch: Dict[str, list] = {}
+    for c in _stripe_list_all("charges", []):
+        cid = c.get("customer")
+        cid = cid.get("id") if isinstance(cid, dict) else cid
+        if cid:
+            ch.setdefault(cid, []).append(c)
+    return {"invoices": inv, "charges": ch}
+
+
 def _stripe_sub_invoices(sub_id: str) -> list:
+    if _SYNC_BULK is not None:
+        return sorted(_SYNC_BULK["invoices"].get(sub_id, []), key=lambda i: i.get("created") or 0)
     d = _stripe_get("invoices", [("subscription", sub_id), ("limit", "100")])
     return sorted(d.get("data") or [], key=lambda i: i.get("created") or 0)
 
@@ -2226,8 +2266,11 @@ def _stripe_sub_invoices(sub_id: str) -> list:
 def _stripe_customer_refunded(customer_id: str, since_ts: float) -> bool:
     if not customer_id:
         return False
-    d = _stripe_get("charges", [("customer", customer_id), ("limit", "100")])
-    for ch in d.get("data") or []:
+    if _SYNC_BULK is not None:
+        charges = _SYNC_BULK["charges"].get(customer_id, [])
+    else:
+        charges = _stripe_get("charges", [("customer", customer_id), ("limit", "100")]).get("data") or []
+    for ch in charges:
         if (ch.get("created") or 0) >= since_ts and ch.get("amount_refunded", 0) and \
                 ch.get("amount_refunded", 0) >= ch.get("amount", 0) > 0:
             return True
@@ -2260,10 +2303,14 @@ def _affiliate_stripe_sync(dry_run: bool = True) -> Dict[str, Any]:
     if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=400, detail="STRIPE_SECRET_KEY not set on the server")
     from datetime import date as _date
+    global _SYNC_BULK
     lock = _AFF_SYNC_LOCK
-    if lock is not None and not lock.acquire(timeout=120):
-        raise HTTPException(status_code=409, detail="a sync is already running")
+    # 5 s, not 120: the dashboard gives up at 120 s, so waiting that long behind the daily
+    # auto-sync (starts 10 min after every deploy) just turned into a timeout. Say so instead.
+    if lock is not None and not lock.acquire(timeout=float(os.getenv("AFFILIATE_SYNC_LOCK_WAIT_S", "5"))):
+        raise HTTPException(status_code=409, detail="a sync is already running - try again in a minute")
     try:
+        _SYNC_BULK = _sync_bulk_load()
         state = _load_json(AFFILIATE_SYNC_STATE_PATH, {})
         auto_from = (os.getenv("AFFILIATE_AUTO_FROM") or state.get("auto_from") or _date.today().isoformat())
         ignored = set(state.get("ignored") or [])
@@ -2430,6 +2477,7 @@ def _affiliate_stripe_sync(dry_run: bool = True) -> Dict[str, Any]:
         return {"ok": True, **summary, "actions": actions, "needs_link_items": needs_link,
                 "waiting_trial_items": waiting, "stripe_by_code": by_code}
     finally:
+        _SYNC_BULK = None
         if lock is not None:
             lock.release()
 
